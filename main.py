@@ -6,19 +6,74 @@ from enum import Enum
 import uuid
 from datetime import datetime
 
+# ADD DATABASE IMPORTS
+import os
+from sqlalchemy import create_engine, Column, String, Float, DateTime, Boolean, Text, Integer
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+
 app = FastAPI(title="Poker Tracker API")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "https://poker-degens.vercel.app",  # ← Add this line!
-        "*"  # ← Temporary wildcard for testing
+        "https://poker-degens.vercel.app",  # Your actual Vercel URL
+        "*"  # Temporary wildcard for testing
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# DATABASE SETUP
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+if DATABASE_URL:
+    engine = create_engine(DATABASE_URL)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base = declarative_base()
+    
+    # Database Models
+    class PlayerDB(Base):
+        __tablename__ = "players"
+        
+        id = Column(String, primary_key=True)
+        name = Column(String, nullable=False)
+        total = Column(Float, default=0.0)
+        created_at = Column(DateTime, nullable=False)
+    
+    class PaymentDB(Base):
+        __tablename__ = "payments"
+        
+        id = Column(String, primary_key=True)
+        player_id = Column(String, nullable=False)
+        amount = Column(Float, nullable=False)
+        method = Column(String, nullable=False)
+        type = Column(String, nullable=False)
+        dealer_fee_applied = Column(Boolean, default=False)
+        status = Column(String, default="pending")
+        timestamp = Column(DateTime, nullable=False)
+    
+    class CashOutDB(Base):
+        __tablename__ = "cashouts"
+        
+        id = Column(String, primary_key=True)
+        player_id = Column(String, nullable=False)
+        amount = Column(Float, nullable=False)
+        timestamp = Column(DateTime, nullable=False)
+        reason = Column(String, default="Player cashed out")
+        confirmed = Column(Boolean, default=False)
+    
+    # Create tables
+    Base.metadata.create_all(bind=engine)
+    print("✅ Database connected and tables created!")
+    
+else:
+    # Fallback to in-memory (development)
+    print("⚠️  Warning: No database configured, using in-memory storage")
 
 # Enums for validation
 class PaymentMethod(str, Enum):
@@ -77,9 +132,10 @@ class CashOutRequest(BaseModel):
 # Game settings
 DEALER_FEE = 35.0
 
-# In-memory storage
-players_db = {}
-cash_outs_db = {}  # NEW: Store cash outs
+# In-memory storage (fallback only)
+if not DATABASE_URL:
+    players_db = {}
+    cash_outs_db = {}
 
 @app.get("/")
 def root():
@@ -87,7 +143,15 @@ def root():
 
 @app.get("/api/health") 
 def health_check():
-    return {"status": "healthy", "players": len(players_db)}
+    if DATABASE_URL:
+        try:
+            with SessionLocal() as db:
+                player_count = db.query(PlayerDB).count()
+                return {"status": "healthy", "players": player_count, "database": "connected"}
+        except Exception as e:
+            return {"status": "error", "database": "disconnected", "error": str(e)}
+    else:
+        return {"status": "healthy", "players": len(players_db), "database": "in-memory"}
 
 @app.get("/api/test")
 def test():
@@ -96,436 +160,1002 @@ def test():
 @app.post("/api/players", response_model=Player)
 def create_player(player_data: PlayerCreate):
     player_id = str(uuid.uuid4())
-    new_player = Player(
-        id=player_id,
-        name=player_data.name,
-        created_at=datetime.now()
-    )
-    players_db[player_id] = new_player.dict()
-    return new_player
-
-@app.get("/api/players", response_model=List[Player])
-def get_players():
-    return list(players_db.values())
-
-@app.post("/api/players/{player_id}/buyin", response_model=Player)
-def add_buyin(player_id: str, buyin_data: BuyInRequest):
-    if player_id not in players_db:
-        raise HTTPException(status_code=404, detail="Player not found")
     
-    player = players_db[player_id]
-    
-    # Determine if this is first buy-in (apply dealer fee)
-    has_previous_buyin = any(
-        payment["type"] == TransactionType.BUY_IN 
-        for payment in player["payments"]
-    )
-    
-    # Create payment record
-    payment_id = str(uuid.uuid4())
-    dealer_fee_applied = not has_previous_buyin  # Apply fee only on first buy-in
-    
-    new_payment = Payment(
-        id=payment_id,
-        amount=buyin_data.amount,
-        method=buyin_data.method,
-        type=TransactionType.BUY_IN,
-        dealer_fee_applied=dealer_fee_applied,
-        timestamp=datetime.now(),
-        status="pending"
-    )
-    
-    # Update player
-    player["payments"].append(new_payment.dict())
-    # ONLY COUNT CONFIRMED PAYMENTS IN PLAYER TOTAL
-    player["total"] = sum(
-        payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
-        for payment in player["payments"]
-        if payment.get("status", "confirmed") == "confirmed"
-    )
-    
-    players_db[player_id] = player
-    return Player(**player)
-
-@app.get("/api/game-stats")
-def get_game_stats():
-    total_pot = 0
-    total_dealer_fees = 0
-    total_buy_ins = 0
-    total_cash_outs = 0
-    payment_method_totals = {}
-    
-    for player in players_db.values():
-        for payment in player["payments"]:
-            # ONLY COUNT CONFIRMED PAYMENTS
-            if payment.get("status", "confirmed") == "confirmed":
-                # Add to pot (minus dealer fee)
-                amount_to_pot = payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
-                total_pot += amount_to_pot
-                
-                # Count dealer fees
-                if payment["dealer_fee_applied"]:
-                    total_dealer_fees += DEALER_FEE
-                
-                # Count total buy-ins
-                total_buy_ins += payment["amount"]
-                
-                # Payment method breakdown
-                method = payment["method"]
-                if method not in payment_method_totals:
-                    payment_method_totals[method] = {"total": 0, "count": 0}
-                payment_method_totals[method]["total"] += payment["amount"]
-                payment_method_totals[method]["count"] += 1
-    
-    # Subtract confirmed cash outs from pot
-    for player_cash_outs in cash_outs_db.values():
-        for cash_out in player_cash_outs:
-            if cash_out["confirmed"]:
-                total_cash_outs += cash_out["amount"]
-                total_pot -= cash_out["amount"]
-    
-    return {
-        "total_pot": round(total_pot, 2),
-        "total_dealer_fees": round(total_dealer_fees, 2),
-        "total_buy_ins": round(total_buy_ins, 2),
-        "total_cash_outs": round(total_cash_outs, 2),
-        "player_count": len(players_db),
-        "payment_method_breakdown": payment_method_totals
-    }
-
-@app.get("/api/players/{player_id}/payment-summary")
-def get_player_payment_summary(player_id: str):
-    if player_id not in players_db:
-        raise HTTPException(status_code=404, detail="Player not found")
-    
-    player = players_db[player_id]
-    payment_summary = {}
-    
-    for payment in player["payments"]:
-        method = payment["method"]
-        amount = payment["amount"]
-        if method not in payment_summary:
-            payment_summary[method] = {"total": 0, "count": 0}
-        payment_summary[method]["total"] += amount
-        payment_summary[method]["count"] += 1
-    
-    return {
-        "player_id": player_id,
-        "player_name": player["name"],
-        "payment_summary": payment_summary,
-        "total_in_pot": player["total"]
-    }
-
-@app.post("/api/rebuys")
-def process_rebuy(rebuy_data: RebuyRequest):
-    # Try to find existing player by name
-    player_id = None
-    for pid, player in players_db.items():
-        if player["name"].lower() == rebuy_data.player_name.lower():
-            player_id = pid
-            break
-    
-    # If player doesn't exist, CREATE THEM automatically
-    if not player_id:
-        player_id = str(uuid.uuid4())
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            db_player = PlayerDB(
+                id=player_id,
+                name=player_data.name,
+                total=0.0,
+                created_at=datetime.now()
+            )
+            db.add(db_player)
+            db.commit()
+            db.refresh(db_player)
+            
+            return Player(
+                id=db_player.id,
+                name=db_player.name,
+                total=db_player.total,
+                payments=[],
+                created_at=db_player.created_at
+            )
+    else:
         new_player = Player(
             id=player_id,
-            name=rebuy_data.player_name,
+            name=player_data.name,
             created_at=datetime.now()
         )
         players_db[player_id] = new_player.dict()
-        player = players_db[player_id]
-        is_new_player = True
+        return new_player
+
+@app.get("/api/players", response_model=List[Player])
+def get_players():
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            players = db.query(PlayerDB).all()
+            result = []
+            
+            for player in players:
+                # Get payments for this player
+                payments = db.query(PaymentDB).filter(PaymentDB.player_id == player.id).all()
+                payment_list = [
+                    Payment(
+                        id=p.id,
+                        amount=p.amount,
+                        method=p.method,
+                        type=p.type,
+                        dealer_fee_applied=p.dealer_fee_applied,
+                        timestamp=p.timestamp,
+                        status=p.status
+                    ) for p in payments
+                ]
+                
+                result.append(Player(
+                    id=player.id,
+                    name=player.name,
+                    total=player.total,
+                    payments=payment_list,
+                    created_at=player.created_at
+                ))
+            
+            return result
     else:
-        player = players_db[player_id]
-        is_new_player = False
-    
-    # SMART DETECTION: Check if this is their first transaction
-    has_any_previous_transactions = len(player["payments"]) > 0
-    
-    # If no previous transactions, this is a buy-in (apply dealer fee)
-    # If they have previous transactions, this is a rebuy (no dealer fee)
-    is_first_buyin = not has_any_previous_transactions
-    transaction_type = TransactionType.BUY_IN if is_first_buyin else TransactionType.REBUY
-    
-    payment_id = str(uuid.uuid4())
-    new_payment = Payment(
-        id=payment_id,
-        amount=rebuy_data.amount,
-        method=rebuy_data.method,
-        type=transaction_type,
-        dealer_fee_applied=is_first_buyin,
-        timestamp=datetime.now(),
-        status="pending"
-    )
-    
-    # Update player
-    player["payments"].append(new_payment.dict())
-    # ONLY COUNT CONFIRMED PAYMENTS IN PLAYER TOTAL
-    player["total"] = sum(
-        payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
-        for payment in player["payments"]
-        if payment.get("status", "confirmed") == "confirmed"
-    )
-    
-    players_db[player_id] = player
-    
-    # Return helpful message
-    if is_new_player:
-        message = f"Welcome {player['name']}! First buy-in processed (${DEALER_FEE} dealer fee applied)"
+        return list(players_db.values())
+
+@app.post("/api/players/{player_id}/buyin", response_model=Player)
+def add_buyin(player_id: str, buyin_data: BuyInRequest):
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            db_player = db.query(PlayerDB).filter(PlayerDB.id == player_id).first()
+            if not db_player:
+                raise HTTPException(status_code=404, detail="Player not found")
+            
+            # Check if player has previous buy-ins
+            has_previous_buyin = db.query(PaymentDB).filter(
+                PaymentDB.player_id == player_id,
+                PaymentDB.type == TransactionType.BUY_IN.value
+            ).first() is not None
+            
+            # Create payment record
+            payment_id = str(uuid.uuid4())
+            dealer_fee_applied = not has_previous_buyin
+            
+            db_payment = PaymentDB(
+                id=payment_id,
+                player_id=player_id,
+                amount=buyin_data.amount,
+                method=buyin_data.method.value,
+                type=TransactionType.BUY_IN.value,
+                dealer_fee_applied=dealer_fee_applied,
+                timestamp=datetime.now(),
+                status="pending"
+            )
+            
+            db.add(db_payment)
+            
+            # Update player total (only confirmed payments)
+            confirmed_payments = db.query(PaymentDB).filter(
+                PaymentDB.player_id == player_id,
+                PaymentDB.status == "confirmed"
+            ).all()
+            
+            db_player.total = sum(
+                payment.amount - (DEALER_FEE if payment.dealer_fee_applied else 0)
+                for payment in confirmed_payments
+            )
+            
+            db.commit()
+            
+            # Return updated player
+            payments = db.query(PaymentDB).filter(PaymentDB.player_id == player_id).all()
+            payment_list = [
+                Payment(
+                    id=p.id,
+                    amount=p.amount,
+                    method=p.method,
+                    type=p.type,
+                    dealer_fee_applied=p.dealer_fee_applied,
+                    timestamp=p.timestamp,
+                    status=p.status
+                ) for p in payments
+            ]
+            
+            return Player(
+                id=db_player.id,
+                name=db_player.name,
+                total=db_player.total,
+                payments=payment_list,
+                created_at=db_player.created_at
+            )
     else:
-        transaction_word = "buy-in" if is_first_buyin else "rebuy"
-        fee_message = f" (${DEALER_FEE} dealer fee applied)" if is_first_buyin else " (no dealer fee)"
-        message = f"{transaction_word.title()} processed for {player['name']}{fee_message}"
-    
-    return {
-        "success": True, 
-        "message": message,
-        "is_new_player": is_new_player,
-        "is_first_buyin": is_first_buyin,
-        "dealer_fee_applied": is_first_buyin,
-        "amount_to_pot": rebuy_data.amount - (DEALER_FEE if is_first_buyin else 0)
-    }
+        # Fallback to in-memory
+        if player_id not in players_db:
+            raise HTTPException(status_code=404, detail="Player not found")
+        
+        player = players_db[player_id]
+        
+        has_previous_buyin = any(
+            payment["type"] == TransactionType.BUY_IN 
+            for payment in player["payments"]
+        )
+        
+        payment_id = str(uuid.uuid4())
+        dealer_fee_applied = not has_previous_buyin
+        
+        new_payment = Payment(
+            id=payment_id,
+            amount=buyin_data.amount,
+            method=buyin_data.method,
+            type=TransactionType.BUY_IN,
+            dealer_fee_applied=dealer_fee_applied,
+            timestamp=datetime.now(),
+            status="pending"
+        )
+        
+        player["payments"].append(new_payment.dict())
+        player["total"] = sum(
+            payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
+            for payment in player["payments"]
+            if payment.get("status", "confirmed") == "confirmed"
+        )
+        
+        players_db[player_id] = player
+        return Player(**player)
+
+@app.get("/api/game-stats")
+def get_game_stats():
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            players = db.query(PlayerDB).all()
+            payments = db.query(PaymentDB).filter(PaymentDB.status == "confirmed").all()
+            cash_outs = db.query(CashOutDB).filter(CashOutDB.confirmed == True).all()
+            
+            total_pot = sum(p.total for p in players)
+            total_dealer_fees = sum(DEALER_FEE for p in payments if p.dealer_fee_applied)
+            total_buy_ins = sum(p.amount for p in payments)
+            total_cash_outs = sum(c.amount for c in cash_outs)
+            payment_method_totals = {}
+            
+            for payment in payments:
+                method = payment.method
+                if method not in payment_method_totals:
+                    payment_method_totals[method] = {"total": 0, "count": 0}
+                payment_method_totals[method]["total"] += payment.amount
+                payment_method_totals[method]["count"] += 1
+            
+            return {
+                "total_pot": round(total_pot, 2),
+                "total_dealer_fees": round(total_dealer_fees, 2),
+                "total_buy_ins": round(total_buy_ins, 2),
+                "total_cash_outs": round(total_cash_outs, 2),
+                "player_count": len(players),
+                "payment_method_breakdown": payment_method_totals
+            }
+    else:
+        # Original in-memory logic
+        total_pot = 0
+        total_dealer_fees = 0
+        total_buy_ins = 0
+        total_cash_outs = 0
+        payment_method_totals = {}
+        
+        for player in players_db.values():
+            for payment in player["payments"]:
+                if payment.get("status", "confirmed") == "confirmed":
+                    amount_to_pot = payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
+                    total_pot += amount_to_pot
+                    
+                    if payment["dealer_fee_applied"]:
+                        total_dealer_fees += DEALER_FEE
+                    
+                    total_buy_ins += payment["amount"]
+                    
+                    method = payment["method"]
+                    if method not in payment_method_totals:
+                        payment_method_totals[method] = {"total": 0, "count": 0}
+                    payment_method_totals[method]["total"] += payment["amount"]
+                    payment_method_totals[method]["count"] += 1
+        
+        for player_cash_outs in cash_outs_db.values():
+            for cash_out in player_cash_outs:
+                if cash_out["confirmed"]:
+                    total_cash_outs += cash_out["amount"]
+                    total_pot -= cash_out["amount"]
+        
+        return {
+            "total_pot": round(total_pot, 2),
+            "total_dealer_fees": round(total_dealer_fees, 2),
+            "total_buy_ins": round(total_buy_ins, 2),
+            "total_cash_outs": round(total_cash_outs, 2),
+            "player_count": len(players_db),
+            "payment_method_breakdown": payment_method_totals
+        }
+
+@app.get("/api/players/{player_id}/payment-summary")
+def get_player_payment_summary(player_id: str):
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            db_player = db.query(PlayerDB).filter(PlayerDB.id == player_id).first()
+            if not db_player:
+                raise HTTPException(status_code=404, detail="Player not found")
+            
+            payments = db.query(PaymentDB).filter(PaymentDB.player_id == player_id).all()
+            payment_summary = {}
+            
+            for payment in payments:
+                method = payment.method
+                amount = payment.amount
+                if method not in payment_summary:
+                    payment_summary[method] = {"total": 0, "count": 0}
+                payment_summary[method]["total"] += amount
+                payment_summary[method]["count"] += 1
+            
+            return {
+                "player_id": player_id,
+                "player_name": db_player.name,
+                "payment_summary": payment_summary,
+                "total_in_pot": db_player.total
+            }
+    else:
+        if player_id not in players_db:
+            raise HTTPException(status_code=404, detail="Player not found")
+        
+        player = players_db[player_id]
+        payment_summary = {}
+        
+        for payment in player["payments"]:
+            method = payment["method"]
+            amount = payment["amount"]
+            if method not in payment_summary:
+                payment_summary[method] = {"total": 0, "count": 0}
+            payment_summary[method]["total"] += amount
+            payment_summary[method]["count"] += 1
+        
+        return {
+            "player_id": player_id,
+            "player_name": player["name"],
+            "payment_summary": payment_summary,
+            "total_in_pot": player["total"]
+        }
+
+@app.post("/api/rebuys")
+def process_rebuy(rebuy_data: RebuyRequest):
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            # Try to find existing player
+            db_player = db.query(PlayerDB).filter(PlayerDB.name.ilike(rebuy_data.player_name)).first()
+            
+            if not db_player:
+                # Create new player
+                player_id = str(uuid.uuid4())
+                db_player = PlayerDB(
+                    id=player_id,
+                    name=rebuy_data.player_name,
+                    total=0.0,
+                    created_at=datetime.now()
+                )
+                db.add(db_player)
+                is_new_player = True
+            else:
+                is_new_player = False
+            
+            # Check if first transaction
+            has_any_previous_transactions = db.query(PaymentDB).filter(
+                PaymentDB.player_id == db_player.id
+            ).first() is not None
+            
+            is_first_buyin = not has_any_previous_transactions
+            transaction_type = TransactionType.BUY_IN if is_first_buyin else TransactionType.REBUY
+            
+            # Create payment
+            payment_id = str(uuid.uuid4())
+            db_payment = PaymentDB(
+                id=payment_id,
+                player_id=db_player.id,
+                amount=rebuy_data.amount,
+                method=rebuy_data.method.value,
+                type=transaction_type.value,
+                dealer_fee_applied=is_first_buyin,
+                timestamp=datetime.now(),
+                status="pending"
+            )
+            
+            db.add(db_payment)
+            db.commit()
+            
+            # Return helpful message
+            if is_new_player:
+                message = f"Welcome {db_player.name}! First buy-in processed (${DEALER_FEE} dealer fee applied)"
+            else:
+                transaction_word = "buy-in" if is_first_buyin else "rebuy"
+                fee_message = f" (${DEALER_FEE} dealer fee applied)" if is_first_buyin else " (no dealer fee)"
+                message = f"{transaction_word.title()} processed for {db_player.name}{fee_message}"
+            
+            return {
+                "success": True, 
+                "message": message,
+                "is_new_player": is_new_player,
+                "is_first_buyin": is_first_buyin,
+                "dealer_fee_applied": is_first_buyin,
+                "amount_to_pot": rebuy_data.amount - (DEALER_FEE if is_first_buyin else 0)
+            }
+    else:
+        # Original in-memory logic
+        player_id = None
+        for pid, player in players_db.items():
+            if player["name"].lower() == rebuy_data.player_name.lower():
+                player_id = pid
+                break
+        
+        if not player_id:
+            player_id = str(uuid.uuid4())
+            new_player = Player(
+                id=player_id,
+                name=rebuy_data.player_name,
+                created_at=datetime.now()
+            )
+            players_db[player_id] = new_player.dict()
+            player = players_db[player_id]
+            is_new_player = True
+        else:
+            player = players_db[player_id]
+            is_new_player = False
+        
+        has_any_previous_transactions = len(player["payments"]) > 0
+        is_first_buyin = not has_any_previous_transactions
+        transaction_type = TransactionType.BUY_IN if is_first_buyin else TransactionType.REBUY
+        
+        payment_id = str(uuid.uuid4())
+        new_payment = Payment(
+            id=payment_id,
+            amount=rebuy_data.amount,
+            method=rebuy_data.method,
+            type=transaction_type,
+            dealer_fee_applied=is_first_buyin,
+            timestamp=datetime.now(),
+            status="pending"
+        )
+        
+        player["payments"].append(new_payment.dict())
+        player["total"] = sum(
+            payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
+            for payment in player["payments"]
+            if payment.get("status", "confirmed") == "confirmed"
+        )
+        
+        players_db[player_id] = player
+        
+        if is_new_player:
+            message = f"Welcome {player['name']}! First buy-in processed (${DEALER_FEE} dealer fee applied)"
+        else:
+            transaction_word = "buy-in" if is_first_buyin else "rebuy"
+            fee_message = f" (${DEALER_FEE} dealer fee applied)" if is_first_buyin else " (no dealer fee)"
+            message = f"{transaction_word.title()} processed for {player['name']}{fee_message}"
+        
+        return {
+            "success": True, 
+            "message": message,
+            "is_new_player": is_new_player,
+            "is_first_buyin": is_first_buyin,
+            "dealer_fee_applied": is_first_buyin,
+            "amount_to_pot": rebuy_data.amount - (DEALER_FEE if is_first_buyin else 0)
+        }
 
 @app.get("/api/rebuys/recent")
 def get_recent_rebuys():
-    recent_rebuys = []
-    for player in players_db.values():
-        for payment in player["payments"]:
-            if payment["type"] == TransactionType.REBUY:
-                recent_rebuys.append({
-                    "player_name": player["name"],
-                    "amount": payment["amount"],
-                    "method": payment["method"],
-                    "timestamp": payment["timestamp"]
-                })
-    
-    recent_rebuys.sort(key=lambda x: x["timestamp"], reverse=True)
-    return recent_rebuys[:5]
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            recent_payments = db.query(PaymentDB, PlayerDB).join(PlayerDB).filter(
+                PaymentDB.type == TransactionType.REBUY.value
+            ).order_by(PaymentDB.timestamp.desc()).limit(5).all()
+            
+            return [{
+                "player_name": player.name,
+                "amount": payment.amount,
+                "method": payment.method,
+                "timestamp": payment.timestamp
+            } for payment, player in recent_payments]
+    else:
+        recent_rebuys = []
+        for player in players_db.values():
+            for payment in player["payments"]:
+                if payment["type"] == TransactionType.REBUY:
+                    recent_rebuys.append({
+                        "player_name": player["name"],
+                        "amount": payment["amount"],
+                        "method": payment["method"],
+                        "timestamp": payment["timestamp"]
+                    })
+        
+        recent_rebuys.sort(key=lambda x: x["timestamp"], reverse=True)
+        return recent_rebuys[:5]
 
 @app.delete("/api/players/{player_id}/payments/{payment_id}")
 def delete_payment(player_id: str, payment_id: str):
-    if player_id not in players_db:
-        raise HTTPException(status_code=404, detail="Player not found")
-    
-    player = players_db[player_id]
-    
-    # Find and remove the payment
-    payment_to_remove = None
-    for i, payment in enumerate(player["payments"]):
-        if payment["id"] == payment_id:
-            payment_to_remove = player["payments"].pop(i)
-            break
-    
-    if not payment_to_remove:
-        raise HTTPException(status_code=404, detail="Payment not found")
-    
-    # Recalculate player total - ONLY COUNT CONFIRMED PAYMENTS
-    player["total"] = sum(
-        payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
-        for payment in player["payments"]
-        if payment.get("status", "confirmed") == "confirmed"
-    )
-    
-    players_db[player_id] = player
-    return {"success": True, "message": f"Removed ${payment_to_remove['amount']} {payment_to_remove['type']} for {player['name']}"}
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            db_player = db.query(PlayerDB).filter(PlayerDB.id == player_id).first()
+            if not db_player:
+                raise HTTPException(status_code=404, detail="Player not found")
+            
+            payment = db.query(PaymentDB).filter(PaymentDB.id == payment_id).first()
+            if not payment:
+                raise HTTPException(status_code=404, detail="Payment not found")
+            
+            payment_amount = payment.amount
+            payment_type = payment.type
+            
+            # Delete payment
+            db.delete(payment)
+            
+            # Recalculate player total
+            remaining_payments = db.query(PaymentDB).filter(
+                PaymentDB.player_id == player_id,
+                PaymentDB.status == "confirmed"
+            ).all()
+            
+            db_player.total = sum(
+                p.amount - (DEALER_FEE if p.dealer_fee_applied else 0)
+                for p in remaining_payments
+            )
+            
+            db.commit()
+            
+            return {"success": True, "message": f"Removed ${payment_amount} {payment_type} for {db_player.name}"}
+    else:
+        if player_id not in players_db:
+            raise HTTPException(status_code=404, detail="Player not found")
+        
+        player = players_db[player_id]
+        
+        payment_to_remove = None
+        for i, payment in enumerate(player["payments"]):
+            if payment["id"] == payment_id:
+                payment_to_remove = player["payments"].pop(i)
+                break
+        
+        if not payment_to_remove:
+            raise HTTPException(status_code=404, detail="Payment not found")
+        
+        player["total"] = sum(
+            payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
+            for payment in player["payments"]
+            if payment.get("status", "confirmed") == "confirmed"
+        )
+        
+        players_db[player_id] = player
+        return {"success": True, "message": f"Removed ${payment_to_remove['amount']} {payment_to_remove['type']} for {player['name']}"}
 
 @app.get("/api/transactions/recent")
 def get_recent_transactions():
-    """Get all recent transactions across all players for admin view"""
-    all_transactions = []
-    for player in players_db.values():
-        for payment in player["payments"]:
-            all_transactions.append({
-                "id": payment["id"],
-                "player_id": player["id"],
-                "player_name": player["name"],
-                "amount": payment["amount"],
-                "method": payment["method"],
-                "type": payment["type"],
-                "dealer_fee_applied": payment["dealer_fee_applied"],
-                "timestamp": payment["timestamp"],
-                "status": payment.get("status", "confirmed")  # Include status
-            })
-    
-    # Sort by timestamp, most recent first
-    all_transactions.sort(key=lambda x: x["timestamp"], reverse=True)
-    return all_transactions[:20]  # Return last 20 transactions
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            transactions = db.query(PaymentDB, PlayerDB).join(PlayerDB).order_by(PaymentDB.timestamp.desc()).limit(20).all()
+            
+            return [{
+                "id": payment.id,
+                "player_id": payment.player_id,
+                "player_name": player.name,
+                "amount": payment.amount,
+                "method": payment.method,
+                "type": payment.type,
+                "dealer_fee_applied": payment.dealer_fee_applied,
+                "timestamp": payment.timestamp,
+                "status": payment.status
+            } for payment, player in transactions]
+    else:
+        all_transactions = []
+        for player in players_db.values():
+            for payment in player["payments"]:
+                all_transactions.append({
+                    "id": payment["id"],
+                    "player_id": player["id"],
+                    "player_name": player["name"],
+                    "amount": payment["amount"],
+                    "method": payment["method"],
+                    "type": payment["type"],
+                    "dealer_fee_applied": payment["dealer_fee_applied"],
+                    "timestamp": payment["timestamp"],
+                    "status": payment.get("status", "confirmed")
+                })
+        
+        all_transactions.sort(key=lambda x: x["timestamp"], reverse=True)
+        return all_transactions[:20]
 
 @app.delete("/api/players/{player_id}")
 def delete_player(player_id: str):
-    if player_id not in players_db:
-        raise HTTPException(status_code=404, detail="Player not found")
-    
-    player = players_db[player_id]
-    player_name = player["name"]
-    player_total = player["total"]
-    transaction_count = len(player["payments"])
-    
-    # Remove the player
-    del players_db[player_id]
-    
-    # Also remove any cash outs for this player
-    if player_id in cash_outs_db:
-        del cash_outs_db[player_id]
-    
-    return {
-        "success": True, 
-        "message": f"Deleted {player_name} (${player_total} removed from pot, {transaction_count} transactions deleted)"
-    }
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            db_player = db.query(PlayerDB).filter(PlayerDB.id == player_id).first()
+            if not db_player:
+                raise HTTPException(status_code=404, detail="Player not found")
+            
+            player_name = db_player.name
+            player_total = db_player.total
+            
+            # Count transactions
+            transaction_count = db.query(PaymentDB).filter(PaymentDB.player_id == player_id).count()
+            
+            # Delete all payments first
+            db.query(PaymentDB).filter(PaymentDB.player_id == player_id).delete()
+            # Delete all cash outs
+            db.query(CashOutDB).filter(CashOutDB.player_id == player_id).delete()
+            # Delete player
+            db.delete(db_player)
+            db.commit()
+            
+            return {
+                "success": True, 
+                "message": f"Deleted {player_name} (${player_total} removed from pot, {transaction_count} transactions deleted)"
+            }
+    else:
+        if player_id not in players_db:
+            raise HTTPException(status_code=404, detail="Player not found")
+        
+        player = players_db[player_id]
+        player_name = player["name"]
+        player_total = player["total"]
+        transaction_count = len(player["payments"])
+        
+        del players_db[player_id]
+        
+        if player_id in cash_outs_db:
+            del cash_outs_db[player_id]
+        
+        return {
+            "success": True, 
+            "message": f"Deleted {player_name} (${player_total} removed from pot, {transaction_count} transactions deleted)"
+        }
 
 @app.put("/api/players/{player_id}/payments/{payment_id}/confirm")
 def confirm_payment(player_id: str, payment_id: str):
-    if player_id not in players_db:
-        raise HTTPException(status_code=404, detail="Player not found")
-    
-    player = players_db[player_id]
-    
-    # Find the payment
-    payment_found = False
-    for payment in player["payments"]:
-        if payment["id"] == payment_id:
-            if payment.get("status", "confirmed") == "confirmed":
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            db_player = db.query(PlayerDB).filter(PlayerDB.id == player_id).first()
+            if not db_player:
+                raise HTTPException(status_code=404, detail="Player not found")
+            
+            payment = db.query(PaymentDB).filter(PaymentDB.id == payment_id).first()
+            if not payment:
+                raise HTTPException(status_code=404, detail="Payment not found")
+            
+            if payment.status == "confirmed":
                 raise HTTPException(status_code=400, detail="Payment already confirmed")
             
-            payment["status"] = "confirmed"
-            payment["confirmed_at"] = datetime.now().isoformat()
-            payment_found = True
-            break
-    
-    if not payment_found:
-        raise HTTPException(status_code=404, detail="Payment not found")
-    
-    # Recalculate player total after confirming payment
-    player["total"] = sum(
-        payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
-        for payment in player["payments"]
-        if payment.get("status", "confirmed") == "confirmed"
-    )
-    
-    players_db[player_id] = player
-    
-    return {
-        "success": True,
-        "message": f"Payment confirmed for {player['name']}"
-    }
+            payment.status = "confirmed"
+            
+            # Recalculate player total
+            confirmed_payments = db.query(PaymentDB).filter(
+                PaymentDB.player_id == player_id,
+                PaymentDB.status == "confirmed"
+            ).all()
+            
+            db_player.total = sum(
+                p.amount - (DEALER_FEE if p.dealer_fee_applied else 0)
+                for p in confirmed_payments
+            )
+            
+            db.commit()
+            
+            return {
+                "success": True,
+                "message": f"Payment confirmed for {db_player.name}"
+            }
+    else:
+        if player_id not in players_db:
+            raise HTTPException(status_code=404, detail="Player not found")
+        
+        player = players_db[player_id]
+        
+        payment_found = False
+        for payment in player["payments"]:
+            if payment["id"] == payment_id:
+                if payment.get("status", "confirmed") == "confirmed":
+                    raise HTTPException(status_code=400, detail="Payment already confirmed")
+                
+                payment["status"] = "confirmed"
+                payment["confirmed_at"] = datetime.now().isoformat()
+                payment_found = True
+                break
+        
+        if not payment_found:
+            raise HTTPException(status_code=404, detail="Payment not found")
+        
+        player["total"] = sum(
+            payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
+            for payment in player["payments"]
+            if payment.get("status", "confirmed") == "confirmed"
+        )
+        
+        players_db[player_id] = player
+        
+        return {
+            "success": True,
+            "message": f"Payment confirmed for {player['name']}"
+        }
 
 @app.get("/api/pending-payments")
 def get_pending_payments():
-    pending_payments = []
-    
-    for player_id, player in players_db.items():
-        for payment in player["payments"]:
-            if payment.get("status", "confirmed") == "pending":  # Default old payments to confirmed
-                pending_payments.append({
-                    **payment,
-                    "player_id": player_id,
-                    "player_name": player["name"]
-                })
-    
-    # Sort by timestamp (newest first)
-    pending_payments.sort(key=lambda x: x["timestamp"], reverse=True)
-    return pending_payments
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            pending = db.query(PaymentDB, PlayerDB).join(PlayerDB).filter(
+                PaymentDB.status == "pending"
+            ).order_by(PaymentDB.timestamp.desc()).all()
+            
+            return [{
+                "id": payment.id,
+                "player_id": payment.player_id,
+                "player_name": player.name,
+                "amount": payment.amount,
+                "method": payment.method,
+                "type": payment.type,
+                "dealer_fee_applied": payment.dealer_fee_applied,
+                "timestamp": payment.timestamp,
+                "status": payment.status
+            } for payment, player in pending]
+    else:
+        pending_payments = []
+        
+        for player_id, player in players_db.items():
+            for payment in player["payments"]:
+                if payment.get("status", "confirmed") == "pending":
+                    pending_payments.append({
+                        **payment,
+                        "player_id": player_id,
+                        "player_name": player["name"]
+                    })
+        
+        pending_payments.sort(key=lambda x: x["timestamp"], reverse=True)
+        return pending_payments
 
-# NEW CASH OUT ENDPOINTS
+# NEW CASH OUT ENDPOINTS WITH DATABASE SUPPORT
 
 @app.post("/api/players/{player_id}/cashout")
 async def create_cash_out(player_id: str, request: CashOutRequest):
-    """Create a cash out request for a player"""
-    if player_id not in players_db:
-        raise HTTPException(status_code=404, detail="Player not found")
-    
-    player = players_db[player_id]
-    cash_out_amount = request.amount
-    
-    # Validate cash out amount
-    if cash_out_amount <= 0:
-        raise HTTPException(status_code=400, detail="Cash out amount must be positive")
-    
-    if cash_out_amount > player["total"]:
-        raise HTTPException(status_code=400, detail="Cannot cash out more than player's total")
-    
-    # Create cash out record
-    cash_out_id = str(uuid.uuid4())
-    cash_out = {
-        "id": cash_out_id,
-        "player_id": player_id,
-        "amount": cash_out_amount,
-        "timestamp": datetime.now().isoformat(),
-        "reason": request.reason,
-        "confirmed": False
-    }
-    
-    if player_id not in cash_outs_db:
-        cash_outs_db[player_id] = []
-    
-    cash_outs_db[player_id].append(cash_out)
-    
-    return {"success": True, "cash_out_id": cash_out_id}
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            db_player = db.query(PlayerDB).filter(PlayerDB.id == player_id).first()
+            if not db_player:
+                raise HTTPException(status_code=404, detail="Player not found")
+            
+            cash_out_amount = request.amount
+            
+            if cash_out_amount <= 0:
+                raise HTTPException(status_code=400, detail="Cash out amount must be positive")
+            
+            if cash_out_amount > db_player.total:
+                raise HTTPException(status_code=400, detail="Cannot cash out more than player's total")
+            
+            cash_out_id = str(uuid.uuid4())
+            db_cash_out = CashOutDB(
+                id=cash_out_id,
+                player_id=player_id,
+                amount=cash_out_amount,
+                timestamp=datetime.now(),
+                reason=request.reason,
+                confirmed=False
+            )
+            
+            db.add(db_cash_out)
+            db.commit()
+            
+            return {"success": True, "cash_out_id": cash_out_id}
+    else:
+        if player_id not in players_db:
+            raise HTTPException(status_code=404, detail="Player not found")
+        
+        player = players_db[player_id]
+        cash_out_amount = request.amount
+        
+        if cash_out_amount <= 0:
+            raise HTTPException(status_code=400, detail="Cash out amount must be positive")
+        
+        if cash_out_amount > player["total"]:
+            raise HTTPException(status_code=400, detail="Cannot cash out more than player's total")
+        
+        cash_out_id = str(uuid.uuid4())
+        cash_out = {
+            "id": cash_out_id,
+            "player_id": player_id,
+            "amount": cash_out_amount,
+            "timestamp": datetime.now().isoformat(),
+            "reason": request.reason,
+            "confirmed": False
+        }
+        
+        if player_id not in cash_outs_db:
+            cash_outs_db[player_id] = []
+        
+        cash_outs_db[player_id].append(cash_out)
+        
+        return {"success": True, "cash_out_id": cash_out_id}
 
 @app.get("/api/pending-cashouts")
 async def get_pending_cash_outs():
-    """Get all pending cash outs for admin confirmation"""
-    pending = []
-    for player_id, player_cash_outs in cash_outs_db.items():
-        for cash_out in player_cash_outs:
-            if not cash_out["confirmed"]:
-                player_name = players_db[player_id]["name"] if player_id in players_db else "Unknown"
-                pending.append({
-                    **cash_out,
-                    "player_name": player_name
-                })
-    
-    # Sort by timestamp (newest first)
-    pending.sort(key=lambda x: x["timestamp"], reverse=True)
-    return pending
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            pending = db.query(CashOutDB, PlayerDB).join(PlayerDB).filter(
+                CashOutDB.confirmed == False
+            ).order_by(CashOutDB.timestamp.desc()).all()
+            
+            return [{
+                "id": cash_out.id,
+                "player_id": cash_out.player_id,
+                "player_name": player.name,
+                "amount": cash_out.amount,
+                "timestamp": cash_out.timestamp.isoformat(),
+                "reason": cash_out.reason,
+                "confirmed": cash_out.confirmed
+            } for cash_out, player in pending]
+    else:
+        pending = []
+        for player_id, player_cash_outs in cash_outs_db.items():
+            for cash_out in player_cash_outs:
+                if not cash_out["confirmed"]:
+                    player_name = players_db[player_id]["name"] if player_id in players_db else "Unknown"
+                    pending.append({
+                        **cash_out,
+                        "player_name": player_name
+                    })
+        
+        pending.sort(key=lambda x: x["timestamp"], reverse=True)
+        return pending
 
 @app.put("/api/cashouts/{cash_out_id}/confirm")
 async def confirm_cash_out(cash_out_id: str):
-    """Confirm a cash out and update player total"""
-    # Find the cash out
-    cash_out_found = None
-    player_id_found = None
-    
-    for player_id, player_cash_outs in cash_outs_db.items():
-        for cash_out in player_cash_outs:
-            if cash_out["id"] == cash_out_id and not cash_out["confirmed"]:
-                cash_out_found = cash_out
-                player_id_found = player_id
-                break
-        if cash_out_found:
-            break
-    
-    if not cash_out_found:
-        raise HTTPException(status_code=404, detail="Cash out not found or already confirmed")
-    
-    # Confirm the cash out
-    cash_out_found["confirmed"] = True
-    cash_out_found["confirmed_at"] = datetime.now().isoformat()
-    
-    # Reduce player's total
-    if player_id_found in players_db:
-        players_db[player_id_found]["total"] -= cash_out_found["amount"]
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            cash_out = db.query(CashOutDB).filter(CashOutDB.id == cash_out_id).first()
+            if not cash_out or cash_out.confirmed:
+                raise HTTPException(status_code=404, detail="Cash out not found or already confirmed")
+            
+            # Confirm the cash out
+            cash_out.confirmed = True
+            
+            # Reduce player's total
+            db_player = db.query(PlayerDB).filter(PlayerDB.id == cash_out.player_id).first()
+            if db_player:
+                db_player.total -= cash_out.amount
+                if db_player.total < 0:
+                    db_player.total = 0
+            
+            db.commit()
+            return {"success": True}
+    else:
+        cash_out_found = None
+        player_id_found = None
         
-        # Ensure total doesn't go negative
-        if players_db[player_id_found]["total"] < 0:
-            players_db[player_id_found]["total"] = 0
-    
-    return {"success": True}
+        for player_id, player_cash_outs in cash_outs_db.items():
+            for cash_out in player_cash_outs:
+                if cash_out["id"] == cash_out_id and not cash_out["confirmed"]:
+                    cash_out_found = cash_out
+                    player_id_found = player_id
+                    break
+            if cash_out_found:
+                break
+        
+        if not cash_out_found:
+            raise HTTPException(status_code=404, detail="Cash out not found or already confirmed")
+        
+        cash_out_found["confirmed"] = True
+        cash_out_found["confirmed_at"] = datetime.now().isoformat()
+        
+        if player_id_found in players_db:
+            players_db[player_id_found]["total"] -= cash_out_found["amount"]
+            
+            if players_db[player_id_found]["total"] < 0:
+                players_db[player_id_found]["total"] = 0
+        
+        return {"success": True}
 
 @app.get("/api/cashouts/history")
 async def get_cash_out_history():
-    """Get all confirmed cash outs for reconciliation"""
-    confirmed_cash_outs = []
-    for player_id, player_cash_outs in cash_outs_db.items():
-        for cash_out in player_cash_outs:
-            if cash_out["confirmed"]:
-                player_name = players_db[player_id]["name"] if player_id in players_db else "Unknown"
-                confirmed_cash_outs.append({
-                    **cash_out,
-                    "player_name": player_name
-                })
-    return sorted(confirmed_cash_outs, key=lambda x: x["timestamp"], reverse=True)
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            confirmed = db.query(CashOutDB, PlayerDB).join(PlayerDB).filter(
+                CashOutDB.confirmed == True
+            ).order_by(CashOutDB.timestamp.desc()).all()
+            
+            return [{
+                "id": cash_out.id,
+                "player_id": cash_out.player_id,
+                "player_name": player.name,
+                "amount": cash_out.amount,
+                "timestamp": cash_out.timestamp.isoformat(),
+                "reason": cash_out.reason,
+                "confirmed": cash_out.confirmed
+            } for cash_out, player in confirmed]
+    else:
+        confirmed_cash_outs = []
+        for player_id, player_cash_outs in cash_outs_db.items():
+            for cash_out in player_cash_outs:
+                if cash_out["confirmed"]:
+                    player_name = players_db[player_id]["name"] if player_id in players_db else "Unknown"
+                    confirmed_cash_outs.append({
+                        **cash_out,
+                        "player_name": player_name
+                    })
+        return sorted(confirmed_cash_outs, key=lambda x: x["timestamp"], reverse=True)
+
+# BACKUP AND RESTORE ENDPOINTS
+
+@app.get("/api/admin/backup")
+def backup_game_data():
+    """Export all game data as comprehensive JSON backup"""
+    try:
+        backup_data = {
+            "backup_timestamp": datetime.now().isoformat(),
+            "app_version": "1.0",
+            "players": [],
+            "payments": [],
+            "cashouts": [],
+            "game_stats": {}
+        }
+        
+        if DATABASE_URL:
+            with SessionLocal() as db:
+                # Get players
+                players = db.query(PlayerDB).all()
+                backup_data["players"] = [{
+                    "id": p.id,
+                    "name": p.name,
+                    "total": p.total,
+                    "created_at": p.created_at.isoformat()
+                } for p in players]
+                
+                # Get payments
+                payments = db.query(PaymentDB).all()
+                backup_data["payments"] = [{
+                    "id": p.id,
+                    "player_id": p.player_id,
+                    "amount": p.amount,
+                    "method": p.method,
+                    "type": p.type,
+                    "dealer_fee_applied": p.dealer_fee_applied,
+                    "status": p.status,
+                    "timestamp": p.timestamp.isoformat()
+                } for p in payments]
+                
+                # Get cash outs
+                cash_outs = db.query(CashOutDB).all()
+                backup_data["cashouts"] = [{
+                    "id": c.id,
+                    "player_id": c.player_id,
+                    "amount": c.amount,
+                    "timestamp": c.timestamp.isoformat(),
+                    "reason": c.reason,
+                    "confirmed": c.confirmed
+                } for c in cash_outs]
+        else:
+            # In-memory backup
+            backup_data["players"] = list(players_db.values())
+            backup_data["payments"] = []
+            backup_data["cashouts"] = []
+            
+            # Extract payments from player data
+            for player in players_db.values():
+                if "payments" in player:
+                    for payment in player["payments"]:
+                        backup_data["payments"].append({
+                            **payment,
+                            "player_id": player["id"]
+                        })
+            
+            # Extract cash outs
+            for player_id, player_cash_outs in cash_outs_db.items():
+                for cash_out in player_cash_outs:
+                    backup_data["cashouts"].append(cash_out)
+        
+        # Calculate game statistics
+        total_pot = sum(p["total"] for p in backup_data["players"])
+        total_payments = sum(p["amount"] for p in backup_data["payments"])
+        total_cash_outs = sum(c["amount"] for c in backup_data["cashouts"] if c["confirmed"])
+        
+        backup_data["game_stats"] = {
+            "total_pot": total_pot,
+            "total_payments": total_payments,
+            "total_cash_outs": total_cash_outs,
+            "player_count": len(backup_data["players"]),
+            "payment_count": len(backup_data["payments"])
+        }
+        
+        return backup_data
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Backup failed: {str(e)}")
+
+@app.post("/api/admin/restore")
+def restore_game_data(backup_data: dict):
+    """Restore game data from backup"""
+    try:
+        if DATABASE_URL:
+            with SessionLocal() as db:
+                # Clear existing data first
+                db.query(CashOutDB).delete()
+                db.query(PaymentDB).delete()
+                db.query(PlayerDB).delete()
+                db.commit()
+                
+                # Restore players
+                if "players" in backup_data:
+                    for player_data in backup_data["players"]:
+                        db_player = PlayerDB(
+                            id=player_data["id"],
+                            name=player_data["name"],
+                            total=player_data.get("total", 0.0),
+                            created_at=datetime.fromisoformat(player_data["created_at"].replace("Z", "+00:00")) if "created_at" in player_data else datetime.now()
+                        )
+                        db.add(db_player)
+                    db.commit()
+                
+                # Restore payments
+                if "payments" in backup_data:
+                    for payment_data in backup_data["payments"]:
+                        db_payment = PaymentDB(
+                            id=payment_data["id"],
+                            player_id=payment_data["player_id"],
+                            amount=payment_data["amount"],
+                            method=payment_data["method"],
+                            type=payment_data["type"],
+                            dealer_fee_applied=payment_data.get("dealer_fee_applied", False),
+                            status=payment_data.get("status", "confirmed"),
+                            timestamp=datetime.fromisoformat(payment_data["timestamp"].replace("Z", "+00:00")) if "timestamp" in payment_data else datetime.now()
+                        )
+                        db.add(db_payment)
+                    db.commit()
+                
+                # Restore cash outs
+                if "cashouts" in backup_data:
+                    for cashout_data in backup_data["cashouts"]:
+                        db_cashout = CashOutDB(
+                            id=cashout_data["id"],
+                            player_id=cashout_data["player_id"],
+                            amount=cashout_data["amount"],
+                            timestamp=datetime.fromisoformat(cashout_data["timestamp"].replace("Z", "+00:00")) if "timestamp" in cashout_data else datetime.now(),
+                            reason=cashout_data.get("reason", "Player cashed out"),
+                            confirmed=cashout_data.get("confirmed", False)
+                        )
+                        db.add(db_cashout)
+                    db.commit()
+        else:
+            # In-memory restore
+            players_db.clear()
+            cash_outs_db.clear()
+            
+            if "players" in backup_data:
+                for player_data in backup_data["players"]:
+                    players_db[player_data["id"]] = player_data
+        
+        return {
+            "success": True, 
+            "message": f"Restored {len(backup_data.get('players', []))} players, {len(backup_data.get('payments', []))} payments, and {len(backup_data.get('cashouts', []))} cash outs",
+            "restored_at": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Restore failed: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     import os

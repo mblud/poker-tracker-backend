@@ -566,17 +566,27 @@ def process_rebuy(rebuy_data: RebuyRequest):
 def get_recent_rebuys():
     if DATABASE_URL:
         with SessionLocal() as db:
-            recent_payments = db.query(PaymentDB, PlayerDB).join(PlayerDB).filter(
+            # FIXED: No JOIN, separate queries
+            recent_payments = db.query(PaymentDB).filter(
                 PaymentDB.type == TransactionType.REBUY.value
             ).order_by(PaymentDB.timestamp.desc()).limit(5).all()
             
-            return [{
-                "player_name": player.name,
-                "amount": payment.amount,
-                "method": payment.method,
-                "timestamp": payment.timestamp
-            } for payment, player in recent_payments]
+            result = []
+            for payment in recent_payments:
+                # Get player name separately - NO JOIN
+                player = db.query(PlayerDB).filter(PlayerDB.id == payment.player_id).first()
+                player_name = player.name if player else "Unknown Player"
+                
+                result.append({
+                    "player_name": player_name,
+                    "amount": payment.amount,
+                    "method": payment.method,
+                    "timestamp": payment.timestamp
+                })
+            
+            return result
     else:
+        # Your existing in-memory code stays the same
         recent_rebuys = []
         for player in players_db.values():
             for payment in player["payments"]:
@@ -651,20 +661,30 @@ def delete_payment(player_id: str, payment_id: str):
 def get_recent_transactions():
     if DATABASE_URL:
         with SessionLocal() as db:
-            transactions = db.query(PaymentDB, PlayerDB).join(PlayerDB).order_by(PaymentDB.timestamp.desc()).limit(20).all()
+            # FIXED: No JOIN, separate queries
+            payments = db.query(PaymentDB).order_by(PaymentDB.timestamp.desc()).limit(20).all()
+            result = []
             
-            return [{
-                "id": payment.id,
-                "player_id": payment.player_id,
-                "player_name": player.name,
-                "amount": payment.amount,
-                "method": payment.method,
-                "type": payment.type,
-                "dealer_fee_applied": payment.dealer_fee_applied,
-                "timestamp": payment.timestamp,
-                "status": payment.status
-            } for payment, player in transactions]
+            for payment in payments:
+                # Get player name separately - NO JOIN
+                player = db.query(PlayerDB).filter(PlayerDB.id == payment.player_id).first()
+                player_name = player.name if player else "Unknown Player"
+                
+                result.append({
+                    "id": payment.id,
+                    "player_id": payment.player_id,
+                    "player_name": player_name,
+                    "amount": payment.amount,
+                    "method": payment.method,
+                    "type": payment.type,
+                    "dealer_fee_applied": payment.dealer_fee_applied,
+                    "timestamp": payment.timestamp,
+                    "status": payment.status
+                })
+            
+            return result
     else:
+        # Your existing in-memory code stays the same
         all_transactions = []
         for player in players_db.values():
             for payment in player["payments"]:
@@ -799,24 +819,31 @@ def confirm_payment(player_id: str, payment_id: str):
 def get_pending_payments():
     if DATABASE_URL:
         with SessionLocal() as db:
-            pending = db.query(PaymentDB, PlayerDB).join(PlayerDB).filter(
-                PaymentDB.status == "pending"
-            ).order_by(PaymentDB.timestamp.desc()).all()
+            # FIXED: No JOIN, separate queries
+            pending_payments = db.query(PaymentDB).filter(PaymentDB.status == "pending").all()
+            result = []
             
-            return [{
-                "id": payment.id,
-                "player_id": payment.player_id,
-                "player_name": player.name,
-                "amount": payment.amount,
-                "method": payment.method,
-                "type": payment.type,
-                "dealer_fee_applied": payment.dealer_fee_applied,
-                "timestamp": payment.timestamp,
-                "status": payment.status
-            } for payment, player in pending]
+            for payment in pending_payments:
+                # Get player name separately - NO JOIN
+                player = db.query(PlayerDB).filter(PlayerDB.id == payment.player_id).first()
+                player_name = player.name if player else "Unknown Player"
+                
+                result.append({
+                    "id": payment.id,
+                    "player_id": payment.player_id,
+                    "player_name": player_name,
+                    "amount": payment.amount,
+                    "method": payment.method,
+                    "type": payment.type,
+                    "dealer_fee_applied": payment.dealer_fee_applied,
+                    "timestamp": payment.timestamp,
+                    "status": payment.status
+                })
+            
+            return result
     else:
+        # Your existing in-memory code stays the same
         pending_payments = []
-        
         for player_id, player in players_db.items():
             for payment in player["payments"]:
                 if payment.get("status", "confirmed") == "pending":
@@ -895,20 +922,29 @@ async def create_cash_out(player_id: str, request: CashOutRequest):
 async def get_pending_cash_outs():
     if DATABASE_URL:
         with SessionLocal() as db:
-            pending = db.query(CashOutDB, PlayerDB).join(PlayerDB).filter(
-                CashOutDB.confirmed == False
-            ).order_by(CashOutDB.timestamp.desc()).all()
+            # FIXED: No JOIN, separate queries
+            pending = db.query(CashOutDB).filter(CashOutDB.confirmed == False).all()
+            result = []
             
-            return [{
-                "id": cash_out.id,
-                "player_id": cash_out.player_id,
-                "player_name": player.name,
-                "amount": cash_out.amount,
-                "timestamp": cash_out.timestamp.isoformat(),
-                "reason": cash_out.reason,
-                "confirmed": cash_out.confirmed
-            } for cash_out, player in pending]
+            for cash_out in pending:
+                # Get player name separately - NO JOIN
+                player = db.query(PlayerDB).filter(PlayerDB.id == cash_out.player_id).first()
+                player_name = player.name if player else "Unknown Player"
+                
+                result.append({
+                    "id": cash_out.id,
+                    "player_id": cash_out.player_id,
+                    "player_name": player_name,
+                    "amount": cash_out.amount,
+                    "timestamp": cash_out.timestamp.isoformat(),
+                    "reason": cash_out.reason,
+                    "confirmed": cash_out.confirmed
+                })
+            
+            result.sort(key=lambda x: x["timestamp"], reverse=True)
+            return result
     else:
+        # Your existing in-memory code stays the same
         pending = []
         for player_id, player_cash_outs in cash_outs_db.items():
             for cash_out in player_cash_outs:

@@ -337,70 +337,33 @@ def add_buyin(player_id: str, buyin_data: BuyInRequest):
 
 @app.get("/api/game-stats")
 def get_game_stats():
-    if DATABASE_URL:
-        with SessionLocal() as db:
-            players = db.query(PlayerDB).all()
-            payments = db.query(PaymentDB).filter(PaymentDB.status == "confirmed").all()
-            cash_outs = db.query(CashOutDB).filter(CashOutDB.confirmed == True).all()
-            
-            total_pot = sum(p.total for p in players)
-            total_dealer_fees = sum(DEALER_FEE for p in payments if p.dealer_fee_applied)
-            total_buy_ins = sum(p.amount for p in payments)
-            total_cash_outs = sum(c.amount for c in cash_outs)
-            payment_method_totals = {}
-            
-            for payment in payments:
-                method = payment.method
-                if method not in payment_method_totals:
-                    payment_method_totals[method] = {"total": 0, "count": 0}
-                payment_method_totals[method]["total"] += payment.amount
-                payment_method_totals[method]["count"] += 1
-            
-            return {
-                "total_pot": round(total_pot, 2),
-                "total_dealer_fees": round(total_dealer_fees, 2),
-                "total_buy_ins": round(total_buy_ins, 2),
-                "total_cash_outs": round(total_cash_outs, 2),
-                "player_count": len(players),
-                "payment_method_breakdown": payment_method_totals
-            }
-    else:
-        # Original in-memory logic
-        total_pot = 0
-        total_dealer_fees = 0
-        total_buy_ins = 0
-        total_cash_outs = 0
+   if DATABASE_URL:
+    with SessionLocal() as db:
+        players = db.query(PlayerDB).all()
+        payments = db.query(PaymentDB).filter(PaymentDB.status == "confirmed").all()
+        confirmed_cash_outs = db.query(CashOutDB).filter(CashOutDB.confirmed == True).all()
+        
+        # Calculate totals
+        total_pot = sum(p.total for p in players)  # This should already reflect cash outs
+        total_dealer_fees = sum(DEALER_FEE for p in payments if p.dealer_fee_applied)
+        total_buy_ins = sum(p.amount for p in payments)
+        total_cash_outs = sum(c.amount for c in confirmed_cash_outs)
+        
+        # Payment method breakdown
         payment_method_totals = {}
-        
-        for player in players_db.values():
-            for payment in player["payments"]:
-                if payment.get("status", "confirmed") == "confirmed":
-                    amount_to_pot = payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
-                    total_pot += amount_to_pot
-                    
-                    if payment["dealer_fee_applied"]:
-                        total_dealer_fees += DEALER_FEE
-                    
-                    total_buy_ins += payment["amount"]
-                    
-                    method = payment["method"]
-                    if method not in payment_method_totals:
-                        payment_method_totals[method] = {"total": 0, "count": 0}
-                    payment_method_totals[method]["total"] += payment["amount"]
-                    payment_method_totals[method]["count"] += 1
-        
-        for player_cash_outs in cash_outs_db.values():
-            for cash_out in player_cash_outs:
-                if cash_out["confirmed"]:
-                    total_cash_outs += cash_out["amount"]
-                    total_pot -= cash_out["amount"]
+        for payment in payments:
+            method = payment.method
+            if method not in payment_method_totals:
+                payment_method_totals[method] = {"total": 0, "count": 0}
+            payment_method_totals[method]["total"] += payment.amount
+            payment_method_totals[method]["count"] += 1
         
         return {
             "total_pot": round(total_pot, 2),
             "total_dealer_fees": round(total_dealer_fees, 2),
             "total_buy_ins": round(total_buy_ins, 2),
             "total_cash_outs": round(total_cash_outs, 2),
-            "player_count": len(players_db),
+            "player_count": len(players),
             "payment_method_breakdown": payment_method_totals
         }
 
@@ -914,23 +877,33 @@ async def get_pending_cash_outs():
 async def confirm_cash_out(cash_out_id: str):
     if DATABASE_URL:
         with SessionLocal() as db:
+            # Find the cash out
             cash_out = db.query(CashOutDB).filter(CashOutDB.id == cash_out_id).first()
             if not cash_out or cash_out.confirmed:
                 raise HTTPException(status_code=404, detail="Cash out not found or already confirmed")
             
+            # Find the player
+            player = db.query(PlayerDB).filter(PlayerDB.id == cash_out.player_id).first()
+            if not player:
+                raise HTTPException(status_code=404, detail="Player not found")
+            
             # Confirm the cash out
             cash_out.confirmed = True
             
-            # Reduce player's total
-            db_player = db.query(PlayerDB).filter(PlayerDB.id == cash_out.player_id).first()
-            if db_player:
-                db_player.total -= cash_out.amount
-                if db_player.total < 0:
-                    db_player.total = 0
+            # FIXED: Properly update player's total
+            player.total = max(0, player.total - cash_out.amount)
             
             db.commit()
-            return {"success": True}
+            
+            return {
+                "success": True,
+                "message": f"Cash out confirmed: {player.name} withdrew ${cash_out.amount}. New balance: ${player.total}",
+                "player_name": player.name,
+                "cash_out_amount": cash_out.amount,
+                "new_player_total": player.total
+            }
     else:
+        # In-memory fallback
         cash_out_found = None
         player_id_found = None
         
@@ -946,16 +919,67 @@ async def confirm_cash_out(cash_out_id: str):
         if not cash_out_found:
             raise HTTPException(status_code=404, detail="Cash out not found or already confirmed")
         
+        # Confirm the cash out
         cash_out_found["confirmed"] = True
         cash_out_found["confirmed_at"] = datetime.now().isoformat()
         
+        # Update player total
         if player_id_found in players_db:
-            players_db[player_id_found]["total"] -= cash_out_found["amount"]
+            old_total = players_db[player_id_found]["total"]
+            players_db[player_id_found]["total"] = max(0, old_total - cash_out_found["amount"])
             
-            if players_db[player_id_found]["total"] < 0:
-                players_db[player_id_found]["total"] = 0
+            return {
+                "success": True,
+                "message": f"Cash out confirmed: {players_db[player_id_found]['name']} withdrew ${cash_out_found['amount']}",
+                "new_player_total": players_db[player_id_found]["total"]
+            }
         
         return {"success": True}
+    
+    # ADD THIS DEBUG ENDPOINT TO YOUR MAIN.PY
+
+@app.get("/api/debug/cashouts")
+def debug_cash_outs():
+    """Debug all cash outs and their impact on totals"""
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            # Get all cash outs
+            cash_outs = db.query(CashOutDB).all()
+            cash_out_data = []
+            
+            total_confirmed_cash_outs = 0
+            for cash_out in cash_outs:
+                player = db.query(PlayerDB).filter(PlayerDB.id == cash_out.player_id).first()
+                player_name = player.name if player else "Unknown"
+                
+                if cash_out.confirmed:
+                    total_confirmed_cash_outs += cash_out.amount
+                
+                cash_out_data.append({
+                    "id": cash_out.id,
+                    "player_name": player_name,
+                    "amount": cash_out.amount,
+                    "confirmed": cash_out.confirmed,
+                    "timestamp": cash_out.timestamp.isoformat()
+                })
+            
+            # Get current totals
+            players = db.query(PlayerDB).all()
+            total_player_balances = sum(p.total for p in players)
+            
+            confirmed_payments = db.query(PaymentDB).filter(PaymentDB.status == "confirmed").all()
+            total_money_in = sum(p.amount - (DEALER_FEE if p.dealer_fee_applied else 0) for p in confirmed_payments)
+            
+            return {
+                "cash_outs": cash_out_data,
+                "total_confirmed_cash_outs": total_confirmed_cash_outs,
+                "total_player_balances": total_player_balances,
+                "total_money_in": total_money_in,
+                "pot_should_be": total_money_in - total_confirmed_cash_outs,
+                "pot_calculation_correct": abs((total_money_in - total_confirmed_cash_outs) - total_player_balances) < 0.01
+            }
+    else:
+        return {"error": "Database not configured"}
 
 @app.get("/api/cashouts/history")
 async def get_cash_out_history():

@@ -192,34 +192,46 @@ def create_player(player_data: PlayerCreate):
 @app.get("/api/players", response_model=List[Player])
 def get_players():
     if DATABASE_URL:
-        with SessionLocal() as db:
-            players = db.query(PlayerDB).all()
-            result = []
+       with SessionLocal() as db:
+        players = db.query(PlayerDB).all()
+        result = []
+        
+        for player in players:
+            # Get ALL payments for this player
+            payments = db.query(PaymentDB).filter(PaymentDB.player_id == player.id).all()
+            payment_list = [
+                Payment(
+                    id=p.id,
+                    amount=p.amount,
+                    method=p.method,
+                    type=p.type,
+                    dealer_fee_applied=p.dealer_fee_applied,
+                    timestamp=p.timestamp,
+                    status=p.status
+                ) for p in payments
+            ]
             
-            for player in players:
-                # Get payments for this player
-                payments = db.query(PaymentDB).filter(PaymentDB.player_id == player.id).all()
-                payment_list = [
-                    Payment(
-                        id=p.id,
-                        amount=p.amount,
-                        method=p.method,
-                        type=p.type,
-                        dealer_fee_applied=p.dealer_fee_applied,
-                        timestamp=p.timestamp,
-                        status=p.status
-                    ) for p in payments
-                ]
-                
-                result.append(Player(
-                    id=player.id,
-                    name=player.name,
-                    total=player.total,
-                    payments=payment_list,
-                    created_at=player.created_at
-                ))
+            # FIXED: Recalculate total from confirmed payments only
+            confirmed_total = sum(
+                p.amount - (DEALER_FEE if p.dealer_fee_applied else 0)
+                for p in payments 
+                if p.status == "confirmed"
+            )
             
-            return result
+            # Update the database if it's wrong
+            if abs(player.total - confirmed_total) > 0.01:  # Fix rounding issues
+                player.total = confirmed_total
+                db.commit()
+            
+            result.append(Player(
+                id=player.id,
+                name=player.name,
+                total=confirmed_total,  # Use calculated total, not stored total
+                payments=payment_list,
+                created_at=player.created_at
+            ))
+        
+        return result
     else:
         return list(players_db.values())
 
@@ -442,120 +454,54 @@ def get_player_payment_summary(player_id: str):
 @app.post("/api/rebuys")
 def process_rebuy(rebuy_data: RebuyRequest):
     if DATABASE_URL:
-        with SessionLocal() as db:
-            # Try to find existing player
-            db_player = db.query(PlayerDB).filter(PlayerDB.name.ilike(rebuy_data.player_name)).first()
-            
-            if not db_player:
-                # Create new player
-                player_id = str(uuid.uuid4())
-                db_player = PlayerDB(
-                    id=player_id,
-                    name=rebuy_data.player_name,
-                    total=0.0,
-                    created_at=datetime.now()
-                )
-                db.add(db_player)
-                is_new_player = True
-            else:
-                is_new_player = False
-            
-            # Check if first transaction
-            has_any_previous_transactions = db.query(PaymentDB).filter(
-                PaymentDB.player_id == db_player.id
-            ).first() is not None
-            
-            is_first_buyin = not has_any_previous_transactions
-            transaction_type = TransactionType.BUY_IN if is_first_buyin else TransactionType.REBUY
-            
-            # Create payment
-            payment_id = str(uuid.uuid4())
-            db_payment = PaymentDB(
-                id=payment_id,
-                player_id=db_player.id,
-                amount=rebuy_data.amount,
-                method=rebuy_data.method.value,
-                type=transaction_type.value,
-                dealer_fee_applied=is_first_buyin,
-                timestamp=datetime.now(),
-                status="pending"
-            )
-            
-            db.add(db_payment)
-            db.commit()
-            
-            # Return helpful message
-            if is_new_player:
-                message = f"Welcome {db_player.name}! First buy-in processed (${DEALER_FEE} dealer fee applied)"
-            else:
-                transaction_word = "buy-in" if is_first_buyin else "rebuy"
-                fee_message = f" (${DEALER_FEE} dealer fee applied)" if is_first_buyin else " (no dealer fee)"
-                message = f"{transaction_word.title()} processed for {db_player.name}{fee_message}"
-            
-            return {
-                "success": True, 
-                "message": message,
-                "is_new_player": is_new_player,
-                "is_first_buyin": is_first_buyin,
-                "dealer_fee_applied": is_first_buyin,
-                "amount_to_pot": rebuy_data.amount - (DEALER_FEE if is_first_buyin else 0)
-            }
-    else:
-        # Original in-memory logic
-        player_id = None
-        for pid, player in players_db.items():
-            if player["name"].lower() == rebuy_data.player_name.lower():
-                player_id = pid
-                break
+       with SessionLocal() as db:
+        # Try to find existing player
+        db_player = db.query(PlayerDB).filter(PlayerDB.name.ilike(rebuy_data.player_name)).first()
         
-        if not player_id:
+        if not db_player:
+            # Create new player with $0 total (payments are pending!)
             player_id = str(uuid.uuid4())
-            new_player = Player(
+            db_player = PlayerDB(
                 id=player_id,
                 name=rebuy_data.player_name,
+                total=0.0,  # ← IMPORTANT: Start with $0, only update when confirmed
                 created_at=datetime.now()
             )
-            players_db[player_id] = new_player.dict()
-            player = players_db[player_id]
+            db.add(db_player)
+            db.commit()
             is_new_player = True
         else:
-            player = players_db[player_id]
             is_new_player = False
         
-        has_any_previous_transactions = len(player["payments"]) > 0
+        # Check if first transaction
+        has_any_previous_transactions = db.query(PaymentDB).filter(
+            PaymentDB.player_id == db_player.id
+        ).first() is not None
+        
         is_first_buyin = not has_any_previous_transactions
         transaction_type = TransactionType.BUY_IN if is_first_buyin else TransactionType.REBUY
         
+        # Create payment as PENDING (don't update player total yet!)
         payment_id = str(uuid.uuid4())
-        new_payment = Payment(
+        db_payment = PaymentDB(
             id=payment_id,
+            player_id=db_player.id,
             amount=rebuy_data.amount,
-            method=rebuy_data.method,
-            type=transaction_type,
+            method=rebuy_data.method.value,
+            type=transaction_type.value,
             dealer_fee_applied=is_first_buyin,
             timestamp=datetime.now(),
-            status="pending"
+            status="pending"  # ← IMPORTANT: Pending until host confirms
         )
         
-        player["payments"].append(new_payment.dict())
-        player["total"] = sum(
-            payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
-            for payment in player["payments"]
-            if payment.get("status", "confirmed") == "confirmed"
-        )
+        db.add(db_payment)
+        db.commit()
         
-        players_db[player_id] = player
-        
-        if is_new_player:
-            message = f"Welcome {player['name']}! First buy-in processed (${DEALER_FEE} dealer fee applied)"
-        else:
-            transaction_word = "buy-in" if is_first_buyin else "rebuy"
-            fee_message = f" (${DEALER_FEE} dealer fee applied)" if is_first_buyin else " (no dealer fee)"
-            message = f"{transaction_word.title()} processed for {player['name']}{fee_message}"
+        # DON'T UPDATE db_player.total here - only update when confirmed!
         
         return {
             "success": True, 
-            "message": message,
+            "message": f"Payment submitted for {db_player.name} - waiting for host approval",
             "is_new_player": is_new_player,
             "is_first_buyin": is_first_buyin,
             "dealer_fee_applied": is_first_buyin,
@@ -752,10 +698,7 @@ def delete_player(player_id: str):
 def confirm_payment(player_id: str, payment_id: str):
     if DATABASE_URL:
         with SessionLocal() as db:
-            db_player = db.query(PlayerDB).filter(PlayerDB.id == player_id).first()
-            if not db_player:
-                raise HTTPException(status_code=404, detail="Player not found")
-            
+            # Find the payment
             payment = db.query(PaymentDB).filter(PaymentDB.id == payment_id).first()
             if not payment:
                 raise HTTPException(status_code=404, detail="Payment not found")
@@ -763,26 +706,35 @@ def confirm_payment(player_id: str, payment_id: str):
             if payment.status == "confirmed":
                 raise HTTPException(status_code=400, detail="Payment already confirmed")
             
+            # Find the player
+            player = db.query(PlayerDB).filter(PlayerDB.id == player_id).first()
+            if not player:
+                raise HTTPException(status_code=404, detail="Player not found")
+            
+            # Confirm the payment
             payment.status = "confirmed"
             
-            # Recalculate player total
-            confirmed_payments = db.query(PaymentDB).filter(
+            # FIXED: Properly recalculate player total from ALL confirmed payments
+            all_confirmed_payments = db.query(PaymentDB).filter(
                 PaymentDB.player_id == player_id,
                 PaymentDB.status == "confirmed"
             ).all()
             
-            db_player.total = sum(
-                p.amount - (DEALER_FEE if p.dealer_fee_applied else 0)
-                for p in confirmed_payments
-            )
+            # Calculate new total: amount minus dealer fee (if applied)
+            new_total = 0.0
+            for p in all_confirmed_payments:
+                amount_to_pot = p.amount - (DEALER_FEE if p.dealer_fee_applied else 0)
+                new_total += amount_to_pot
             
+            player.total = new_total
             db.commit()
             
             return {
                 "success": True,
-                "message": f"Payment confirmed for {db_player.name}"
+                "message": f"Payment confirmed for {player.name}. New total: ${player.total:.2f}"
             }
     else:
+        # In-memory fallback - same logic
         if player_id not in players_db:
             raise HTTPException(status_code=404, detail="Player not found")
         
@@ -795,13 +747,13 @@ def confirm_payment(player_id: str, payment_id: str):
                     raise HTTPException(status_code=400, detail="Payment already confirmed")
                 
                 payment["status"] = "confirmed"
-                payment["confirmed_at"] = datetime.now().isoformat()
                 payment_found = True
                 break
         
         if not payment_found:
             raise HTTPException(status_code=404, detail="Payment not found")
         
+        # Recalculate total from all confirmed payments
         player["total"] = sum(
             payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
             for payment in player["payments"]
@@ -812,7 +764,7 @@ def confirm_payment(player_id: str, payment_id: str):
         
         return {
             "success": True,
-            "message": f"Payment confirmed for {player['name']}"
+            "message": f"Payment confirmed for {player['name']}. New total: ${player['total']:.2f}"
         }
 
 @app.get("/api/pending-payments")

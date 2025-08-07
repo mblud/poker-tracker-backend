@@ -116,7 +116,7 @@ class Player(BaseModel):
     payments: List[Payment] = []
     created_at: datetime
 
-# NEW: Cash Out Models
+# Cash Out Models
 class CashOut(BaseModel):
     id: str
     player_id: str
@@ -771,10 +771,7 @@ def get_pending_payments():
         pending_payments.sort(key=lambda x: x["timestamp"], reverse=True)
         return pending_payments
 
-# Replace your create_cash_out function in main.py with this fixed version:
-
-# 🔥 REPLACE YOUR create_cash_out FUNCTION WITH THIS:
-
+# 🔥 FIXED: Cash out creation
 @app.post("/api/players/{player_id}/cashout")
 async def create_cash_out(player_id: str, request: CashOutRequest):
     if DATABASE_URL:
@@ -899,6 +896,7 @@ async def get_pending_cash_outs():
         pending.sort(key=lambda x: x["timestamp"], reverse=True)
         return pending
 
+# 🔥 FIXED: Confirm cash out - properly sets player total to 0
 @app.put("/api/cashouts/{cash_out_id}/confirm")
 async def confirm_cash_out(cash_out_id: str):
     if DATABASE_URL:
@@ -916,17 +914,19 @@ async def confirm_cash_out(cash_out_id: str):
             # Confirm the cash out
             cash_out.confirmed = True
             
-            # FIXED: Properly update player's total
-            player.total = max(0, player.total - cash_out.amount)
+            # 🔥 FIXED: Set player total to 0 when they cash out (they're out of the game)
+            old_total = player.total
+            player.total = 0.0  # Player is completely out of the game
             
             db.commit()
             
             return {
                 "success": True,
-                "message": f"Cash out confirmed: {player.name} withdrew ${cash_out.amount}. New balance: ${player.total}",
+                "message": f"Cash out confirmed: {player.name} cashed out ${cash_out.amount}. Player is now out of the game.",
                 "player_name": player.name,
                 "cash_out_amount": cash_out.amount,
-                "new_player_total": player.total
+                "old_player_total": old_total,
+                "new_player_total": 0.0
             }
     else:
         # In-memory fallback
@@ -949,20 +949,57 @@ async def confirm_cash_out(cash_out_id: str):
         cash_out_found["confirmed"] = True
         cash_out_found["confirmed_at"] = datetime.now().isoformat()
         
-        # Update player total
+        # 🔥 FIXED: Set player total to 0 (they're out of the game)
         if player_id_found in players_db:
             old_total = players_db[player_id_found]["total"]
-            players_db[player_id_found]["total"] = max(0, old_total - cash_out_found["amount"])
+            players_db[player_id_found]["total"] = 0.0  # Player is completely out
             
             return {
                 "success": True,
-                "message": f"Cash out confirmed: {players_db[player_id_found]['name']} withdrew ${cash_out_found['amount']}",
-                "new_player_total": players_db[player_id_found]["total"]
+                "message": f"Cash out confirmed: {players_db[player_id_found]['name']} cashed out ${cash_out_found['amount']}",
+                "new_player_total": 0.0
             }
         
         return {"success": True}
-    
-    # ADD THIS DEBUG ENDPOINT TO YOUR MAIN.PY
+
+# 🔥 NEW: Get recent confirmed cash outs for UI display
+@app.get("/api/cashouts/recent")
+async def get_recent_cash_outs():
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            # Get recent confirmed cash outs
+            confirmed = db.query(CashOutDB).filter(
+                CashOutDB.confirmed == True
+            ).order_by(CashOutDB.timestamp.desc()).limit(10).all()
+            
+            result = []
+            for cash_out in confirmed:
+                # Get player name separately - NO JOIN
+                player = db.query(PlayerDB).filter(PlayerDB.id == cash_out.player_id).first()
+                player_name = player.name if player else "Unknown Player"
+                
+                result.append({
+                    "id": cash_out.id,
+                    "player_id": cash_out.player_id,
+                    "player_name": player_name,
+                    "amount": cash_out.amount,
+                    "timestamp": cash_out.timestamp.isoformat(),
+                    "reason": cash_out.reason,
+                    "confirmed": cash_out.confirmed
+                })
+            
+            return result
+    else:
+        confirmed_cash_outs = []
+        for player_id, player_cash_outs in cash_outs_db.items():
+            for cash_out in player_cash_outs:
+                if cash_out["confirmed"]:
+                    player_name = players_db[player_id]["name"] if player_id in players_db else "Unknown"
+                    confirmed_cash_outs.append({
+                        **cash_out,
+                        "player_name": player_name
+                    })
+        return sorted(confirmed_cash_outs, key=lambda x: x["timestamp"], reverse=True)[:10]
 
 @app.get("/api/debug/cashouts")
 def debug_cash_outs():
@@ -1011,19 +1048,27 @@ def debug_cash_outs():
 async def get_cash_out_history():
     if DATABASE_URL:
         with SessionLocal() as db:
-            confirmed = db.query(CashOutDB, PlayerDB).join(PlayerDB).filter(
+            confirmed = db.query(CashOutDB).filter(
                 CashOutDB.confirmed == True
             ).order_by(CashOutDB.timestamp.desc()).all()
             
-            return [{
-                "id": cash_out.id,
-                "player_id": cash_out.player_id,
-                "player_name": player.name,
-                "amount": cash_out.amount,
-                "timestamp": cash_out.timestamp.isoformat(),
-                "reason": cash_out.reason,
-                "confirmed": cash_out.confirmed
-            } for cash_out, player in confirmed]
+            result = []
+            for cash_out in confirmed:
+                # Get player name separately - NO JOIN
+                player = db.query(PlayerDB).filter(PlayerDB.id == cash_out.player_id).first()
+                player_name = player.name if player else "Unknown Player"
+                
+                result.append({
+                    "id": cash_out.id,
+                    "player_id": cash_out.player_id,
+                    "player_name": player_name,
+                    "amount": cash_out.amount,
+                    "timestamp": cash_out.timestamp.isoformat(),
+                    "reason": cash_out.reason,
+                    "confirmed": cash_out.confirmed
+                })
+            
+            return result
     else:
         confirmed_cash_outs = []
         for player_id, player_cash_outs in cash_outs_db.items():

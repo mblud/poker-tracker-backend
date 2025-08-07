@@ -252,50 +252,87 @@ def get_players():
         return list(players_db.values())
 
 # Also fix the game stats calculation:
+# LOCATION: main.py around line 400-500
+# FIND: @app.get("/api/game-stats")
+# REPLACE THE ENTIRE FUNCTION WITH THIS:
+
 @app.get("/api/game-stats")
 def get_game_stats():
-   if DATABASE_URL:
-    with SessionLocal() as db:
-        players = db.query(PlayerDB).all()
-        payments = db.query(PaymentDB).filter(PaymentDB.status == "confirmed").all()
-        confirmed_cash_outs = db.query(CashOutDB).filter(CashOutDB.confirmed == True).all()
-        
-        # 🔥 FIXED: Calculate total pot correctly
-        # Total pot = sum of all player totals (which should already account for cash outs)
-        total_pot = 0.0
-        for player in players:
-            # Check if player has cashed out
-            player_cash_outs = db.query(CashOutDB).filter(
-                CashOutDB.player_id == player.id,
-                CashOutDB.confirmed == True
-            ).all()
+    if DATABASE_URL:
+        with SessionLocal() as db:
+            players = db.query(PlayerDB).all()
+            payments = db.query(PaymentDB).filter(PaymentDB.status == "confirmed").all()
+            confirmed_cash_outs = db.query(CashOutDB).filter(CashOutDB.confirmed == True).all()
             
-            if player_cash_outs:
-                # Player cashed out, contributes 0 to pot
-                total_pot += 0.0
-            else:
-                # Player active, add their total
-                total_pot += player.total
+            # 🔥 FIXED: Total pot = sum of all player totals (which already accounts for cash outs)
+            total_pot = sum(p.total for p in players)
+            
+            total_dealer_fees = sum(DEALER_FEE for p in payments if p.dealer_fee_applied)
+            total_buy_ins = sum(p.amount for p in payments)
+            total_cash_outs = sum(c.amount for c in confirmed_cash_outs)
+            
+            # Payment method breakdown
+            payment_method_totals = {}
+            for payment in payments:
+                method = payment.method
+                if method not in payment_method_totals:
+                    payment_method_totals[method] = {"total": 0, "count": 0}
+                payment_method_totals[method]["total"] += payment.amount
+                payment_method_totals[method]["count"] += 1
+            
+            return {
+                "total_pot": round(total_pot, 2),
+                "total_dealer_fees": round(total_dealer_fees, 2),
+                "total_buy_ins": round(total_buy_ins, 2),
+                "total_cash_outs": round(total_cash_outs, 2),
+                "player_count": len([p for p in players if p.total > 0]),  # Only count active players
+                "payment_method_breakdown": payment_method_totals
+            }
+    else:
+        # In-memory fallback
+        if not players_db:
+            return {
+                "total_pot": 0,
+                "total_dealer_fees": 0,
+                "total_buy_ins": 0,
+                "total_cash_outs": 0,
+                "player_count": 0,
+                "payment_method_breakdown": {}
+            }
         
-        total_dealer_fees = sum(DEALER_FEE for p in payments if p.dealer_fee_applied)
-        total_buy_ins = sum(p.amount for p in payments)
-        total_cash_outs = sum(c.amount for c in confirmed_cash_outs)
+        total_pot = sum(player["total"] for player in players_db.values())
+        active_players = len([p for p in players_db.values() if p["total"] > 0])
         
-        # Payment method breakdown
+        # Calculate totals from in-memory data
+        total_buy_ins = 0
+        total_dealer_fees = 0
         payment_method_totals = {}
-        for payment in payments:
-            method = payment.method
-            if method not in payment_method_totals:
-                payment_method_totals[method] = {"total": 0, "count": 0}
-            payment_method_totals[method]["total"] += payment.amount
-            payment_method_totals[method]["count"] += 1
+        
+        for player in players_db.values():
+            for payment in player.get("payments", []):
+                if payment.get("status", "confirmed") == "confirmed":
+                    total_buy_ins += payment["amount"]
+                    if payment.get("dealer_fee_applied"):
+                        total_dealer_fees += DEALER_FEE
+                    
+                    method = payment["method"]
+                    if method not in payment_method_totals:
+                        payment_method_totals[method] = {"total": 0, "count": 0}
+                    payment_method_totals[method]["total"] += payment["amount"]
+                    payment_method_totals[method]["count"] += 1
+        
+        total_cash_outs = 0
+        for player_cash_outs in cash_outs_db.values():
+            for cash_out in player_cash_outs:
+                if cash_out.get("confirmed"):
+                    total_cash_outs += cash_out["amount"]
         
         return {
             "total_pot": round(total_pot, 2),
             "total_dealer_fees": round(total_dealer_fees, 2),
             "total_buy_ins": round(total_buy_ins, 2),
             "total_cash_outs": round(total_cash_outs, 2),
-            "player_count": len([p for p in players if p.total > 0]),  # Only count active players
+            "player_count": active_players,
             "payment_method_breakdown": payment_method_totals
         }
 
@@ -961,6 +998,8 @@ async def get_pending_cash_outs():
         return pending
 
 # 🔥 FIXED: Confirm cash out - properly sets player total to 0
+# Replace the confirm_cash_out endpoint in main.py with this FIXED version:
+
 @app.put("/api/cashouts/{cash_out_id}/confirm")
 async def confirm_cash_out(cash_out_id: str):
     print(f"🔍 DEBUG: Confirming cash out ID: {cash_out_id}")
@@ -972,59 +1011,78 @@ async def confirm_cash_out(cash_out_id: str):
             if not cash_out or cash_out.confirmed:
                 raise HTTPException(status_code=404, detail="Cash out not found or already confirmed")
             
-            # Find the player
+            # Find the player cashing out
             player = db.query(PlayerDB).filter(PlayerDB.id == cash_out.player_id).first()
             if not player:
                 raise HTTPException(status_code=404, detail="Player not found")
             
-            # 🔥 THE CRITICAL PART: Use the FULL cash out amount from the request
-            full_cash_out_amount = cash_out.amount  # This should be $1000
-            old_player_total = player.total
+            # Store the FULL cash out amount
+            full_cash_out_amount = cash_out.amount
+            player_contribution = player.total  # What they had in the pot
             
-            print(f"💰 DEBUG: FULL cash out amount: ${full_cash_out_amount}")
-            print(f"👤 DEBUG: Player's current total: ${old_player_total}")
+            print(f"💰 CASH OUT: {player.name} cashing out ${full_cash_out_amount:.2f}")
+            print(f"👤 Player contributed: ${player_contribution:.2f}")
+            
+            # Calculate winnings/losses
+            net_winnings = full_cash_out_amount - player_contribution
+            
+            # Get all OTHER active players (with money in pot)
+            other_active_players = db.query(PlayerDB).filter(
+                PlayerDB.id != player.id,
+                PlayerDB.total > 0
+            ).all()
+            
+            total_other_players_money = sum(p.total for p in other_active_players)
+            
+            # CRITICAL: Reduce the pot by the FULL cash out amount
+            if net_winnings > 0:
+                # Player won money - reduce it from others proportionally
+                print(f"🎉 {player.name} WON ${net_winnings:.2f}!")
+                
+                if total_other_players_money > 0:
+                    for other_player in other_active_players:
+                        # Calculate proportional reduction
+                        reduction_ratio = other_player.total / total_other_players_money
+                        reduction_amount = net_winnings * reduction_ratio
+                        
+                        # Reduce other player's total
+                        new_total = max(0, other_player.total - reduction_amount)
+                        print(f"  📉 Reducing {other_player.name}: ${other_player.total:.2f} -> ${new_total:.2f}")
+                        other_player.total = new_total
+            
+            elif net_winnings < 0:
+                # Player lost money (cashing out less than they put in)
+                lost_amount = abs(net_winnings)
+                print(f"😔 {player.name} lost ${lost_amount:.2f}")
+                
+                if other_active_players and total_other_players_money > 0:
+                    # Distribute the lost money to remaining players
+                    for other_player in other_active_players:
+                        bonus_ratio = other_player.total / total_other_players_money
+                        bonus_amount = lost_amount * bonus_ratio
+                        new_total = other_player.total + bonus_amount
+                        print(f"  📈 Bonus to {other_player.name}: ${other_player.total:.2f} -> ${new_total:.2f}")
+                        other_player.total = new_total
+            
+            # Set the cashing out player's total to 0 (they're out)
+            player.total = 0.0
             
             # Confirm the cash out
             cash_out.confirmed = True
             
-            # 🔥 CRITICAL: Player total goes to 0 (they're out of the game)
-            player.total = 0.0
-            
-            # 🔥 Handle winnings: If cash out > player's contribution, reduce other players
-            if full_cash_out_amount > old_player_total:
-                excess_amount = full_cash_out_amount - old_player_total
-                print(f"🎉 DEBUG: Player won ${excess_amount}!")
-                
-                # Get all other active players
-                other_players = db.query(PlayerDB).filter(
-                    PlayerDB.id != player.id,
-                    PlayerDB.total > 0
-                ).all()
-                
-                total_other_players_money = sum(p.total for p in other_players)
-                print(f"💵 DEBUG: Other players have ${total_other_players_money}")
-                
-                if total_other_players_money > 0:
-                    # Reduce each other player's total proportionally
-                    for other_player in other_players:
-                        reduction_ratio = other_player.total / total_other_players_money
-                        reduction_amount = excess_amount * reduction_ratio
-                        other_player.total = max(0, other_player.total - reduction_amount)
-                        print(f"🔄 DEBUG: Reduced {other_player.name} by ${reduction_amount:.2f}")
-            
             db.commit()
-            print(f"✅ DEBUG: Cash out confirmed successfully")
+            
+            print(f"✅ Cash out confirmed: {player.name} received ${full_cash_out_amount:.2f}")
             
             return {
                 "success": True,
-                "message": f"Cash out confirmed: {player.name} cashed out ${full_cash_out_amount}",
+                "message": f"{player.name} cashed out ${full_cash_out_amount:.2f}",
                 "player_name": player.name,
-                "cash_out_amount": full_cash_out_amount,  # Return the FULL amount
-                "old_player_total": old_player_total,
-                "new_player_total": 0.0
+                "cash_out_amount": full_cash_out_amount,
+                "net_winnings": net_winnings
             }
     else:
-        # In-memory version (similar logic)
+        # In-memory version - implement similar logic
         return {"success": True}
 
 # 🔥 NEW: Get recent confirmed cash outs for UI display

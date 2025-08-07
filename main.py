@@ -57,20 +57,6 @@ if DATABASE_URL:
         status = Column(String, default="pending")
         timestamp = Column(DateTime, nullable=False)
     
-    if DATABASE_URL:
-        engine = create_engine(DATABASE_URL)
-    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    Base = declarative_base()
-    
-    # Database Models
-    class PlayerDB(Base):
-        __tablename__ = "players"
-        # ... columns ...
-    
-    class PaymentDB(Base):
-        __tablename__ = "payments"
-        # ... columns ...
-    
     class CashOutDB(Base):
         __tablename__ = "cashouts"
         
@@ -80,14 +66,14 @@ if DATABASE_URL:
         timestamp = Column(DateTime, nullable=False)
         reason = Column(String, default="Player cashed out")
         confirmed = Column(Boolean, default=False)
-        payment_breakdown = Column(Text, default='{}')  # ✅ KEEP THIS
+        payment_breakdown = Column(Text, default='{}')
     
-    # Create tables - ADD drop_all here temporarily
-    Base.metadata.drop_all(bind=engine)  # ← ADD THIS LINE
+    # Create tables - DROP AND RECREATE
+    Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
-    print("✅ Database dropped and recreated with new schema!")
+    print("✅ Database dropped and recreated successfully!")
     
-else:  # ← KEEP THIS ELSE BLOCK!
+else:
     # Fallback to in-memory (development)
     print("⚠️  Warning: No database configured, using in-memory storage")
 

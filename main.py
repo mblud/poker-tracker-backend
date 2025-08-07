@@ -196,65 +196,61 @@ def create_player(player_data: PlayerCreate):
 @app.get("/api/players", response_model=List[Player])
 def get_players():
     if DATABASE_URL:
-       with SessionLocal() as db:
-        players = db.query(PlayerDB).all()
-        result = []
-        
-        for player in players:
-            # Get ALL payments for this player
-            payments = db.query(PaymentDB).filter(PaymentDB.player_id == player.id).all()
-            payment_list = [
-                Payment(
-                    id=p.id,
-                    amount=p.amount,
-                    method=p.method,
-                    type=p.type,
-                    dealer_fee_applied=p.dealer_fee_applied,
-                    timestamp=p.timestamp,
-                    status=p.status
-                ) for p in payments
-            ]
+        with SessionLocal() as db:
+            players = db.query(PlayerDB).all()
+            result = []
             
-            # 🔥 FIXED: Check if player has cashed out
-            confirmed_cash_outs = db.query(CashOutDB).filter(
-                CashOutDB.player_id == player.id,
-                CashOutDB.confirmed == True
-            ).all()
-            
-            if confirmed_cash_outs:
-                # Player has cashed out - their total should be 0
-                current_total = 0.0
-                # Update database to ensure it's 0
-                if player.total != 0.0:
-                    player.total = 0.0
-                    db.commit()
-            else:
-               # Player hasn't cashed out - calculate from confirmed payments
-                current_total = sum(
-    p.amount  # Full amount including dealer fees
-    for p in payments 
-    if p.status == "confirmed"
-)
+            for player in players:
+                # Get ALL payments for this player
+                payments = db.query(PaymentDB).filter(PaymentDB.player_id == player.id).all()
+                payment_list = [
+                    Payment(
+                        id=p.id,
+                        amount=p.amount,
+                        method=p.method,
+                        type=p.type,
+                        dealer_fee_applied=p.dealer_fee_applied,
+                        timestamp=p.timestamp,
+                        status=p.status
+                    ) for p in payments
+                ]
                 
-                # Update database if calculation is different
-                if abs(player.total - current_total) > 0.01:
-                    player.total = current_total
-                    db.commit()
+                # Check if player has cashed out
+                confirmed_cash_outs = db.query(CashOutDB).filter(
+                    CashOutDB.player_id == player.id,
+                    CashOutDB.confirmed == True
+                ).all()
+                
+                if confirmed_cash_outs:
+                    # Player has cashed out - their total should be 0
+                    current_total = 0.0
+                    if player.total != 0.0:
+                        player.total = 0.0
+                        db.commit()
+                else:
+                    # Player hasn't cashed out - calculate from confirmed payments
+                    current_total = sum(
+                        p.amount  # Full amount including dealer fees
+                        for p in payments 
+                        if p.status == "confirmed"
+                    )
+                    
+                    # Update database if calculation is different
+                    if abs(player.total - current_total) > 0.01:
+                        player.total = current_total
+                        db.commit()
+                
+                result.append(Player(
+                    id=player.id,
+                    name=player.name,
+                    total=current_total,
+                    payments=payment_list,
+                    created_at=player.created_at
+                ))
             
-            result.append(Player(
-                id=player.id,
-                name=player.name,
-                total=current_total,
-                payments=payment_list,
-                created_at=player.created_at
-            ))
-        
-        return result
+            return result
     else:
         return list(players_db.values())
-
-# Also fix the game stats calculation:
-# LOCATION: main.py around line 400-500
 # FIND: @app.get("/api/game-stats")
 # REPLACE THE ENTIRE FUNCTION WITH THIS:
 
@@ -755,25 +751,25 @@ def confirm_payment(player_id: str, payment_id: str):
                 raise HTTPException(status_code=404, detail="Player not found")
             
             # Confirm the payment
-        payment.status = "confirmed"
-
-# Recalculate player total from ALL confirmed payments
-        all_confirmed_payments = db.query(PaymentDB).filter(
-    PaymentDB.player_id == player_id,
-    PaymentDB.status == "confirmed"
-).all()
-
-# Calculate new total: FULL amount (including dealer fees)
-        player.total = sum(p.amount for p in all_confirmed_payments)  # Full amount!
-
-        db.commit()
+            payment.status = "confirmed"
             
-        return {
+            # Recalculate player total from ALL confirmed payments
+            all_confirmed_payments = db.query(PaymentDB).filter(
+                PaymentDB.player_id == player_id,
+                PaymentDB.status == "confirmed"
+            ).all()
+            
+            # Calculate new total: FULL amount (including dealer fees)
+            player.total = sum(p.amount for p in all_confirmed_payments)
+            
+            db.commit()
+            
+            return {
                 "success": True,
                 "message": f"Payment confirmed for {player.name}. New total: ${player.total:.2f}"
             }
     else:
-        # In-memory fallback - same logic
+        # In-memory fallback
         if player_id not in players_db:
             raise HTTPException(status_code=404, detail="Player not found")
         
@@ -794,7 +790,7 @@ def confirm_payment(player_id: str, payment_id: str):
         
         # Recalculate total from all confirmed payments
         player["total"] = sum(
-            payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
+            payment["amount"]  # Full amount including dealer fees
             for payment in player["payments"]
             if payment.get("status", "confirmed") == "confirmed"
         )

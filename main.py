@@ -189,6 +189,8 @@ def create_player(player_data: PlayerCreate):
         players_db[player_id] = new_player.dict()
         return new_player
 
+# Replace the get_players endpoint in main.py with this fixed version:
+
 @app.get("/api/players", response_model=List[Player])
 def get_players():
     if DATABASE_URL:
@@ -211,22 +213,36 @@ def get_players():
                 ) for p in payments
             ]
             
-            # FIXED: Recalculate total from confirmed payments only
-            confirmed_total = sum(
-                p.amount - (DEALER_FEE if p.dealer_fee_applied else 0)
-                for p in payments 
-                if p.status == "confirmed"
-            )
+            # 🔥 FIXED: Check if player has cashed out
+            confirmed_cash_outs = db.query(CashOutDB).filter(
+                CashOutDB.player_id == player.id,
+                CashOutDB.confirmed == True
+            ).all()
             
-            # Update the database if it's wrong
-            if abs(player.total - confirmed_total) > 0.01:  # Fix rounding issues
-                player.total = confirmed_total
-                db.commit()
+            if confirmed_cash_outs:
+                # Player has cashed out - their total should be 0
+                current_total = 0.0
+                # Update database to ensure it's 0
+                if player.total != 0.0:
+                    player.total = 0.0
+                    db.commit()
+            else:
+                # Player hasn't cashed out - calculate from confirmed payments
+                current_total = sum(
+                    p.amount - (DEALER_FEE if p.dealer_fee_applied else 0)
+                    for p in payments 
+                    if p.status == "confirmed"
+                )
+                
+                # Update database if calculation is different
+                if abs(player.total - current_total) > 0.01:
+                    player.total = current_total
+                    db.commit()
             
             result.append(Player(
                 id=player.id,
                 name=player.name,
-                total=confirmed_total,  # Use calculated total, not stored total
+                total=current_total,
                 payments=payment_list,
                 created_at=player.created_at
             ))
@@ -234,6 +250,54 @@ def get_players():
         return result
     else:
         return list(players_db.values())
+
+# Also fix the game stats calculation:
+@app.get("/api/game-stats")
+def get_game_stats():
+   if DATABASE_URL:
+    with SessionLocal() as db:
+        players = db.query(PlayerDB).all()
+        payments = db.query(PaymentDB).filter(PaymentDB.status == "confirmed").all()
+        confirmed_cash_outs = db.query(CashOutDB).filter(CashOutDB.confirmed == True).all()
+        
+        # 🔥 FIXED: Calculate total pot correctly
+        # Total pot = sum of all player totals (which should already account for cash outs)
+        total_pot = 0.0
+        for player in players:
+            # Check if player has cashed out
+            player_cash_outs = db.query(CashOutDB).filter(
+                CashOutDB.player_id == player.id,
+                CashOutDB.confirmed == True
+            ).all()
+            
+            if player_cash_outs:
+                # Player cashed out, contributes 0 to pot
+                total_pot += 0.0
+            else:
+                # Player active, add their total
+                total_pot += player.total
+        
+        total_dealer_fees = sum(DEALER_FEE for p in payments if p.dealer_fee_applied)
+        total_buy_ins = sum(p.amount for p in payments)
+        total_cash_outs = sum(c.amount for c in confirmed_cash_outs)
+        
+        # Payment method breakdown
+        payment_method_totals = {}
+        for payment in payments:
+            method = payment.method
+            if method not in payment_method_totals:
+                payment_method_totals[method] = {"total": 0, "count": 0}
+            payment_method_totals[method]["total"] += payment.amount
+            payment_method_totals[method]["count"] += 1
+        
+        return {
+            "total_pot": round(total_pot, 2),
+            "total_dealer_fees": round(total_dealer_fees, 2),
+            "total_buy_ins": round(total_buy_ins, 2),
+            "total_cash_outs": round(total_cash_outs, 2),
+            "player_count": len([p for p in players if p.total > 0]),  # Only count active players
+            "payment_method_breakdown": payment_method_totals
+        }
 
 @app.post("/api/players/{player_id}/buyin", response_model=Player)
 def add_buyin(player_id: str, buyin_data: BuyInRequest):

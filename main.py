@@ -771,7 +771,7 @@ def get_pending_payments():
         pending_payments.sort(key=lambda x: x["timestamp"], reverse=True)
         return pending_payments
 
-# NEW CASH OUT ENDPOINTS WITH DATABASE SUPPORT
+# Replace your create_cash_out function in main.py with this fixed version:
 
 @app.post("/api/players/{player_id}/cashout")
 async def create_cash_out(player_id: str, request: CashOutRequest):
@@ -786,8 +786,20 @@ async def create_cash_out(player_id: str, request: CashOutRequest):
             if cash_out_amount <= 0:
                 raise HTTPException(status_code=400, detail="Cash out amount must be positive")
             
-            if cash_out_amount > db_player.total:
-                raise HTTPException(status_code=400, detail="Cannot cash out more than player's total")
+            # 🔥 FIX: Calculate total pot to allow players to cash out winnings
+            all_players = db.query(PlayerDB).all()
+            total_pot = sum(p.total for p in all_players)
+            
+            # 🚀 POKER LOGIC: Players can cash out up to total pot (they can win!)
+            if cash_out_amount > total_pot:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Cannot cash out ${cash_out_amount:.2f}. Total pot only has ${total_pot:.2f}"
+                )
+            
+            # ❌ REMOVED: OLD LOGIC that prevented cashing out winnings
+            # if cash_out_amount > db_player.total:
+            #     raise HTTPException(status_code=400, detail="Cannot cash out more than player's total")
             
             cash_out_id = str(uuid.uuid4())
             db_cash_out = CashOutDB(
@@ -804,17 +816,23 @@ async def create_cash_out(player_id: str, request: CashOutRequest):
             
             return {"success": True, "cash_out_id": cash_out_id}
     else:
+        # In-memory fallback - also fix this
         if player_id not in players_db:
             raise HTTPException(status_code=404, detail="Player not found")
         
-        player = players_db[player_id]
         cash_out_amount = request.amount
         
         if cash_out_amount <= 0:
             raise HTTPException(status_code=400, detail="Cash out amount must be positive")
         
-        if cash_out_amount > player["total"]:
-            raise HTTPException(status_code=400, detail="Cannot cash out more than player's total")
+        # 🔥 FIX: Calculate total pot for in-memory version too
+        total_pot = sum(player["total"] for player in players_db.values())
+        
+        if cash_out_amount > total_pot:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Cannot cash out ${cash_out_amount:.2f}. Total pot only has ${total_pot:.2f}"
+            )
         
         cash_out_id = str(uuid.uuid4())
         cash_out = {

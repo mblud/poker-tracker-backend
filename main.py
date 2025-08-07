@@ -260,6 +260,7 @@ def get_players():
 
 @app.get("/api/game-stats")
 def get_game_stats():
+    import json
     if DATABASE_URL:
         with SessionLocal() as db:
             players = db.query(PlayerDB).all()
@@ -273,30 +274,42 @@ def get_game_stats():
             total_buy_ins = sum(p.amount for p in payments)
             total_cash_outs = sum(c.amount for c in confirmed_cash_outs)
             
-            # 🔥 UPDATED: Payment method breakdown (money IN minus money OUT)
+            # Payment method breakdown (money IN minus money OUT)
             payment_method_totals = {}
             
             # Add money IN from payments
             for payment in payments:
                 method = payment.method
                 if method not in payment_method_totals:
-                    payment_method_totals[method] = {"total": 0, "count": 0, "cash_outs": 0}
+                    payment_method_totals[method] = {"total": 0, "count": 0, "in": 0, "out": 0}
                 payment_method_totals[method]["total"] += payment.amount
+                payment_method_totals[method]["in"] += payment.amount
                 payment_method_totals[method]["count"] += 1
             
-            # 🔥 NEW: Subtract money OUT from cashouts
+            # Subtract money OUT from cashouts (parse from reason field)
             for cash_out in confirmed_cash_outs:
-                if cash_out.payment_breakdown:
-                    import json
-                    try:
-                        breakdown = json.loads(cash_out.payment_breakdown.replace("'", '"'))
-                        for method, amount in breakdown.items():
-                            if method not in payment_method_totals:
-                                payment_method_totals[method] = {"total": 0, "count": 0, "cash_outs": 0}
-                            payment_method_totals[method]["total"] -= amount
-                            payment_method_totals[method]["cash_outs"] += amount
-                    except:
-                        pass
+                try:
+                    # Try to parse JSON from reason field
+                    if cash_out.reason and cash_out.reason.startswith('{'):
+                        data = json.loads(cash_out.reason)
+                        if "payment_methods" in data:
+                            for method, amount in data["payment_methods"].items():
+                                if method not in payment_method_totals:
+                                    payment_method_totals[method] = {"total": 0, "count": 0, "in": 0, "out": 0}
+                                payment_method_totals[method]["total"] -= amount
+                                payment_method_totals[method]["out"] += amount
+                    else:
+                        # Old cashouts default to cash
+                        if "Cash" not in payment_method_totals:
+                            payment_method_totals["Cash"] = {"total": 0, "count": 0, "in": 0, "out": 0}
+                        payment_method_totals["Cash"]["total"] -= cash_out.amount
+                        payment_method_totals["Cash"]["out"] += cash_out.amount
+                except:
+                    # If parsing fails, assume cash
+                    if "Cash" not in payment_method_totals:
+                        payment_method_totals["Cash"] = {"total": 0, "count": 0, "in": 0, "out": 0}
+                    payment_method_totals["Cash"]["total"] -= cash_out.amount
+                    payment_method_totals["Cash"]["out"] += cash_out.amount
             
             return {
                 "total_pot": round(total_pot, 2),
@@ -307,7 +320,7 @@ def get_game_stats():
                 "payment_method_breakdown": payment_method_totals
             }
     else:
-        # In-memory implementation similar...
+        # In-memory implementation...
         pass
 
 @app.post("/api/players/{player_id}/buyin", response_model=Player)
@@ -975,11 +988,12 @@ async def get_pending_cash_outs():
 # Replace the confirm_cash_out endpoint in main.py with this FIXED version:
 
 @app.put("/api/cashouts/{cash_out_id}/confirm")
-async def confirm_cash_out(cash_out_id: str, payment_methods: dict = None):
+async def confirm_cash_out(cash_out_id: str, payment_data: dict = None):
     """
-    Confirm cashout with payment method breakdown
-    payment_methods should be like: {"Cash": 500, "Apple Pay": 200}
+    Confirm cashout. payment_data can include payment methods:
+    {"payment_methods": {"Cash": 500, "Apple Pay": 200}, "reason": "Player cashed out"}
     """
+    import json
     print(f"🔍 DEBUG: Confirming cash out ID: {cash_out_id}")
     
     if DATABASE_URL:
@@ -994,19 +1008,32 @@ async def confirm_cash_out(cash_out_id: str, payment_methods: dict = None):
             if not player:
                 raise HTTPException(status_code=404, detail="Player not found")
             
-            # Validate payment methods if provided
-            if payment_methods:
-                total_paid_out = sum(payment_methods.values())
-                if abs(total_paid_out - cash_out.amount) > 0.01:
+            cash_out_amount = cash_out.amount
+            
+            # Store payment methods in the reason field as JSON
+            if payment_data and "payment_methods" in payment_data:
+                payment_methods = payment_data["payment_methods"]
+                total_paid = sum(payment_methods.values())
+                
+                if abs(total_paid - cash_out_amount) > 0.01:
                     raise HTTPException(
                         status_code=400, 
-                        detail=f"Payment methods total ${total_paid_out} doesn't match cashout amount ${cash_out.amount}"
+                        detail=f"Payment total ${total_paid} doesn't match cashout ${cash_out_amount}"
                     )
-                # Store the breakdown
-                cash_out.payment_breakdown = str(payment_methods)
+                
+                # Store as JSON string in reason field
+                cash_out.reason = json.dumps({
+                    "reason": payment_data.get("reason", "Player cashed out"),
+                    "payment_methods": payment_methods
+                })
             else:
                 # Default to cash if not specified
-                cash_out.payment_breakdown = str({"Cash": cash_out.amount})
+                cash_out.reason = json.dumps({
+                    "reason": "Player cashed out",
+                    "payment_methods": {"Cash": cash_out_amount}
+                })
+            
+            print(f"💰 CASH OUT: {player.name} cashing out ${cash_out_amount:.2f}")
             
             # Set player total to 0
             player.total = 0.0
@@ -1016,16 +1043,16 @@ async def confirm_cash_out(cash_out_id: str, payment_methods: dict = None):
             
             db.commit()
             
-            print(f"✅ Cash out confirmed: {player.name} received ${cash_out.amount:.2f}")
-            print(f"   Payment breakdown: {cash_out.payment_breakdown}")
+            print(f"✅ Cash out confirmed: {player.name} received ${cash_out_amount:.2f}")
             
             return {
                 "success": True,
-                "message": f"{player.name} cashed out ${cash_out.amount:.2f}",
-                "payment_breakdown": payment_methods or {"Cash": cash_out.amount}
+                "message": f"{player.name} cashed out ${cash_out_amount:.2f}",
+                "player_name": player.name,
+                "cash_out_amount": cash_out_amount
             }
     else:
-        # In-memory version
+        # In-memory version similar logic
         if not cash_outs_db:
             raise HTTPException(status_code=404, detail="No cash outs found")
         
@@ -1036,7 +1063,12 @@ async def confirm_cash_out(cash_out_id: str, payment_methods: dict = None):
                         raise HTTPException(status_code=400, detail="Already confirmed")
                     
                     cash_out["confirmed"] = True
-                    cash_out["payment_breakdown"] = payment_methods or {"Cash": cash_out["amount"]}
+                    
+                    if payment_data and "payment_methods" in payment_data:
+                        cash_out["reason"] = json.dumps({
+                            "reason": payment_data.get("reason", "Player cashed out"),
+                            "payment_methods": payment_data["payment_methods"]
+                        })
                     
                     if player_id in players_db:
                         players_db[player_id]["total"] = 0
@@ -1044,7 +1076,6 @@ async def confirm_cash_out(cash_out_id: str, payment_methods: dict = None):
                     return {"success": True}
         
         raise HTTPException(status_code=404, detail="Cash out not found")
-# 🔥 NEW: Get recent confirmed cash outs for UI display
 @app.get("/api/cashouts/recent")
 async def get_recent_cash_outs():
     if DATABASE_URL:

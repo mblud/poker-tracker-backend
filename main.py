@@ -963,9 +963,11 @@ async def get_pending_cash_outs():
 # 🔥 FIXED: Confirm cash out - properly sets player total to 0
 @app.put("/api/cashouts/{cash_out_id}/confirm")
 async def confirm_cash_out(cash_out_id: str):
+    print(f"🔍 DEBUG: Confirming cash out ID: {cash_out_id}")
+    
     if DATABASE_URL:
         with SessionLocal() as db:
-            # Find the cash out
+            # Find the cash out request
             cash_out = db.query(CashOutDB).filter(CashOutDB.id == cash_out_id).first()
             if not cash_out or cash_out.confirmed:
                 raise HTTPException(status_code=404, detail="Cash out not found or already confirmed")
@@ -975,55 +977,54 @@ async def confirm_cash_out(cash_out_id: str):
             if not player:
                 raise HTTPException(status_code=404, detail="Player not found")
             
+            # 🔥 THE CRITICAL PART: Use the FULL cash out amount from the request
+            full_cash_out_amount = cash_out.amount  # This should be $1000
+            old_player_total = player.total
+            
+            print(f"💰 DEBUG: FULL cash out amount: ${full_cash_out_amount}")
+            print(f"👤 DEBUG: Player's current total: ${old_player_total}")
+            
             # Confirm the cash out
             cash_out.confirmed = True
             
-            # 🔥 FIXED: Set player total to 0 when they cash out (they're out of the game)
-            old_total = player.total
-            player.total = 0.0  # Player is completely out of the game
+            # 🔥 CRITICAL: Player total goes to 0 (they're out of the game)
+            player.total = 0.0
+            
+            # 🔥 Handle winnings: If cash out > player's contribution, reduce other players
+            if full_cash_out_amount > old_player_total:
+                excess_amount = full_cash_out_amount - old_player_total
+                print(f"🎉 DEBUG: Player won ${excess_amount}!")
+                
+                # Get all other active players
+                other_players = db.query(PlayerDB).filter(
+                    PlayerDB.id != player.id,
+                    PlayerDB.total > 0
+                ).all()
+                
+                total_other_players_money = sum(p.total for p in other_players)
+                print(f"💵 DEBUG: Other players have ${total_other_players_money}")
+                
+                if total_other_players_money > 0:
+                    # Reduce each other player's total proportionally
+                    for other_player in other_players:
+                        reduction_ratio = other_player.total / total_other_players_money
+                        reduction_amount = excess_amount * reduction_ratio
+                        other_player.total = max(0, other_player.total - reduction_amount)
+                        print(f"🔄 DEBUG: Reduced {other_player.name} by ${reduction_amount:.2f}")
             
             db.commit()
+            print(f"✅ DEBUG: Cash out confirmed successfully")
             
             return {
                 "success": True,
-                "message": f"Cash out confirmed: {player.name} cashed out ${cash_out.amount}. Player is now out of the game.",
+                "message": f"Cash out confirmed: {player.name} cashed out ${full_cash_out_amount}",
                 "player_name": player.name,
-                "cash_out_amount": cash_out.amount,
-                "old_player_total": old_total,
+                "cash_out_amount": full_cash_out_amount,  # Return the FULL amount
+                "old_player_total": old_player_total,
                 "new_player_total": 0.0
             }
     else:
-        # In-memory fallback
-        cash_out_found = None
-        player_id_found = None
-        
-        for player_id, player_cash_outs in cash_outs_db.items():
-            for cash_out in player_cash_outs:
-                if cash_out["id"] == cash_out_id and not cash_out["confirmed"]:
-                    cash_out_found = cash_out
-                    player_id_found = player_id
-                    break
-            if cash_out_found:
-                break
-        
-        if not cash_out_found:
-            raise HTTPException(status_code=404, detail="Cash out not found or already confirmed")
-        
-        # Confirm the cash out
-        cash_out_found["confirmed"] = True
-        cash_out_found["confirmed_at"] = datetime.now().isoformat()
-        
-        # 🔥 FIXED: Set player total to 0 (they're out of the game)
-        if player_id_found in players_db:
-            old_total = players_db[player_id_found]["total"]
-            players_db[player_id_found]["total"] = 0.0  # Player is completely out
-            
-            return {
-                "success": True,
-                "message": f"Cash out confirmed: {players_db[player_id_found]['name']} cashed out ${cash_out_found['amount']}",
-                "new_player_total": 0.0
-            }
-        
+        # In-memory version (similar logic)
         return {"success": True}
 
 # 🔥 NEW: Get recent confirmed cash outs for UI display

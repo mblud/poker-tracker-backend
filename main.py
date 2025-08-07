@@ -267,41 +267,32 @@ def get_game_stats():
             confirmed_cash_outs = db.query(CashOutDB).filter(CashOutDB.confirmed == True).all()
             players = db.query(PlayerDB).all()
             
-            # 🔥 THE CORRECT CALCULATION:
-            # Step 1: Calculate total money that went INTO the pot
-            total_money_in = 0
-            for payment in payments:
-                if payment.dealer_fee_applied:
-                    total_money_in += (payment.amount - DEALER_FEE)  # Subtract dealer fee
-                else:
-                    total_money_in += payment.amount  # Full amount goes to pot
+            # 🔥 FIXED: Include dealer fees in the pot!
+            # Total money IN (INCLUDING dealer fees - full amount players paid)
+            total_money_in = sum(p.amount for p in payments)  # Full amounts, no subtraction
             
-            # Step 2: Calculate total money that went OUT of the pot
+            # Total money OUT (cashouts)
             total_money_out = sum(c.amount for c in confirmed_cash_outs)
             
-            # Step 3: ACTUAL POT = IN minus OUT
+            # ACTUAL POT = Money IN minus Money OUT
             total_pot = total_money_in - total_money_out
             
-            # Other stats
+            # Track dealer fees separately (to pay dealer later)
             total_dealer_fees = sum(DEALER_FEE for p in payments if p.dealer_fee_applied)
-            total_buy_ins = sum(p.amount for p in payments)  # Raw buy-ins before fees
+            total_buy_ins = sum(p.amount for p in payments)
             
-            # Payment method breakdown (for the "Pot Breakdown" section)
+            # Payment method breakdown (also use full amounts)
             payment_method_totals = {}
             
-            # Add money IN
             for payment in payments:
                 method = payment.method
                 if method not in payment_method_totals:
                     payment_method_totals[method] = {"total": 0, "count": 0}
-                # Add the amount that went to pot (minus dealer fee if applicable)
-                amount_to_pot = payment.amount - (DEALER_FEE if payment.dealer_fee_applied else 0)
-                payment_method_totals[method]["total"] += amount_to_pot
+                payment_method_totals[method]["total"] += payment.amount  # Full amount
                 payment_method_totals[method]["count"] += 1
             
-            # Subtract money OUT
+            # Subtract cashouts from payment methods
             for cash_out in confirmed_cash_outs:
-                # Try to parse payment methods from payment_breakdown
                 try:
                     if cash_out.payment_breakdown and cash_out.payment_breakdown != '{}':
                         data = json.loads(cash_out.payment_breakdown)
@@ -310,37 +301,22 @@ def get_game_stats():
                                 payment_method_totals[method] = {"total": 0, "count": 0}
                             payment_method_totals[method]["total"] -= amount
                     else:
-                        # Default to cash if not specified
                         if "Cash" not in payment_method_totals:
                             payment_method_totals["Cash"] = {"total": 0, "count": 0}
                         payment_method_totals["Cash"]["total"] -= cash_out.amount
                 except:
-                    # If parsing fails, assume cash
                     if "Cash" not in payment_method_totals:
                         payment_method_totals["Cash"] = {"total": 0, "count": 0}
                     payment_method_totals["Cash"]["total"] -= cash_out.amount
             
-            # Count active players (those who haven't cashed out completely)
-            active_player_count = len([p for p in players if p.total > 0])
-            
             return {
-                "total_pot": round(total_pot, 2),  # This will be $430 in your example!
+                "total_pot": round(total_pot, 2),
                 "total_dealer_fees": round(total_dealer_fees, 2),
                 "total_buy_ins": round(total_buy_ins, 2),
                 "total_cash_outs": round(total_money_out, 2),
-                "player_count": active_player_count,
+                "player_count": len([p for p in players if p.total > 0]),
                 "payment_method_breakdown": payment_method_totals
             }
-    else:
-        # In-memory fallback - implement same logic
-        return {
-            "total_pot": 0,
-            "total_dealer_fees": 0,
-            "total_buy_ins": 0,
-            "total_cash_outs": 0,
-            "player_count": 0,
-            "payment_method_breakdown": {}
-        }
 
 @app.post("/api/players/{player_id}/buyin", response_model=Player)
 def add_buyin(player_id: str, buyin_data: BuyInRequest):

@@ -229,12 +229,12 @@ def get_players():
                     player.total = 0.0
                     db.commit()
             else:
-                # Player hasn't cashed out - calculate from confirmed payments
+               # Player hasn't cashed out - calculate from confirmed payments
                 current_total = sum(
-                    p.amount - (DEALER_FEE if p.dealer_fee_applied else 0)
-                    for p in payments 
-                    if p.status == "confirmed"
-                )
+    p.amount  # Full amount including dealer fees
+    for p in payments 
+    if p.status == "confirmed"
+)
                 
                 # Update database if calculation is different
                 if abs(player.total - current_total) > 0.01:
@@ -355,10 +355,7 @@ def add_buyin(player_id: str, buyin_data: BuyInRequest):
                 PaymentDB.status == "confirmed"
             ).all()
             
-            db_player.total = sum(
-                payment.amount - (DEALER_FEE if payment.dealer_fee_applied else 0)
-                for payment in confirmed_payments
-            )
+            db_player.total = sum(payment.amount for payment in confirmed_payments)  # Full amount!
             
             db.commit()
             
@@ -410,7 +407,7 @@ def add_buyin(player_id: str, buyin_data: BuyInRequest):
         
         player["payments"].append(new_payment.dict())
         player["total"] = sum(
-            payment["amount"] - (DEALER_FEE if payment["dealer_fee_applied"] else 0)
+            payment["amount"]  # Full amount!
             for payment in player["payments"]
             if payment.get("status", "confirmed") == "confirmed"
         )
@@ -758,24 +755,20 @@ def confirm_payment(player_id: str, payment_id: str):
                 raise HTTPException(status_code=404, detail="Player not found")
             
             # Confirm the payment
-            payment.status = "confirmed"
+        payment.status = "confirmed"
+
+# Recalculate player total from ALL confirmed payments
+        all_confirmed_payments = db.query(PaymentDB).filter(
+    PaymentDB.player_id == player_id,
+    PaymentDB.status == "confirmed"
+).all()
+
+# Calculate new total: FULL amount (including dealer fees)
+        player.total = sum(p.amount for p in all_confirmed_payments)  # Full amount!
+
+        db.commit()
             
-            # FIXED: Properly recalculate player total from ALL confirmed payments
-            all_confirmed_payments = db.query(PaymentDB).filter(
-                PaymentDB.player_id == player_id,
-                PaymentDB.status == "confirmed"
-            ).all()
-            
-            # Calculate new total: amount minus dealer fee (if applied)
-            new_total = 0.0
-            for p in all_confirmed_payments:
-                amount_to_pot = p.amount - (DEALER_FEE if p.dealer_fee_applied else 0)
-                new_total += amount_to_pot
-            
-            player.total = new_total
-            db.commit()
-            
-            return {
+        return {
                 "success": True,
                 "message": f"Payment confirmed for {player.name}. New total: ${player.total:.2f}"
             }

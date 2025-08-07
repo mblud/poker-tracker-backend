@@ -69,7 +69,7 @@ if DATABASE_URL:
         payment_breakdown = Column(Text, default='{}')
     
     # Create tables - DROP AND RECREATE
-    Base.metadata.drop_all(bind=engine)
+# Base.metadata.drop_all(bind=engine)  # Comment this out after it works
     Base.metadata.create_all(bind=engine)
     print("✅ Database dropped and recreated successfully!")
     
